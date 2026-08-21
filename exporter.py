@@ -160,7 +160,7 @@ def _export_materialized_checkpoint(checkpoint: Path, output: Path, width: int, 
     import comfy.sd
 
     exported_model, _clip, _vae, _ = comfy.sd.load_checkpoint_guess_config(
-        str(checkpoint), output_vae=False, output_clip=False, embedding_directory=[]
+        str(checkpoint), output_vae=False, output_clip=False, embedding_directory=[], disable_dynamic=True,
     )
     if exported_model is None:
         raise RuntimeError(f"Materialized checkpoint did not provide a diffusion MODEL: {checkpoint}")
@@ -224,12 +224,22 @@ def _checkpoint_unet_fingerprint(checkpoint: Path) -> str:
 
 
 def _materialize_and_write_checkpoint(model: Any, clip: Any, vae: Any, checkpoint: Path) -> str:
-    """Materialize the exact MODEL/CLIP/ VAE graph state into a standard checkpoint."""
+    """Materialize a Dynamic-VRAM graph without directly patching its inputs.
+
+    The Dynamic VRAM patcher rejects direct ``patch_model`` calls.  SDXL's CLIP
+    checkpoint converter also cannot concatenate deferred FakeDevice tensors,
+    so every state-dictionary tensor is resolved to a real CPU tensor before
+    the normal ComfyUI model-config conversion runs.
+    """
+    import comfy.model_management
     import comfy.utils
 
-    cpu = torch.device("cpu")
-    model.patch_model(device_to=cpu, force_patch_weights=True)
-    clip.patcher.patch_model(device_to=cpu, force_patch_weights=True)
+    managed_models = [model, clip.load_model()]
+    vae_patcher = getattr(vae, "patcher", None)
+    if vae_patcher is not None:
+        managed_models.append(vae_patcher)
+    comfy.model_management.load_models_gpu(managed_models)
+
     unet_state = _materialize_cpu_state_dict(
         model.model_state_dict_for_saving(model.model.diffusion_model, "diffusion_model.")
     )
@@ -243,6 +253,7 @@ def _materialize_and_write_checkpoint(model: Any, clip: Any, vae: Any, checkpoin
         "format": "pt", "modelspec.architecture": "stable-diffusion-xl-v1-base",
         "trt_exporter.source": "ComfyUI MODEL, CLIP, and VAE inputs",
         "trt_exporter.loras": "already applied by the input graph",
+        "trt_exporter.materialization": "ComfyUI model manager + resolved CPU tensors",
     })
     # The caller traces this serialized checkpoint, not the deferred input patcher.
     del state_dict
