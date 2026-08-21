@@ -1,0 +1,15 @@
+"""Combined TensorRT custom-node package with separate exporter and loader nodes."""
+
+from .exporter import (
+    NODE_CLASS_MAPPINGS as _EXPORTER_CLASSES,
+    NODE_DISPLAY_NAME_MAPPINGS as _EXPORTER_NAMES,
+)
+from .loader import (
+    NODE_CLASS_MAPPINGS as _LOADER_CLASSES,
+    NODE_DISPLAY_NAME_MAPPINGS as _LOADER_NAMES,
+)
+
+NODE_CLASS_MAPPINGS = {**_EXPORTER_CLASSES, **_LOADER_CLASSES}
+NODE_DISPLAY_NAME_MAPPINGS = {**_EXPORTER_NAMES, **_LOADER_NAMES}
+
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
