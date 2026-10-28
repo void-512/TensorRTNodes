@@ -56,7 +56,7 @@ def engine_name(chain: dict, width: int, height: int) -> str:
 @contextmanager
 def package_lock(root):
     TEMP_ROOT.mkdir(parents=True, exist_ok=True)
-    locks = TEMP_ROOT / "locks" / str(Path(root).resolve()).lstrip("/").replace(":", "_")
+    locks = TEMP_ROOT / "locks" / str(Path(root).resolve()).replace("\\", "/").lstrip("/").replace(":", "_")
     locks.mkdir(parents=True, exist_ok=True)
     lock = locks / "active"
     try:

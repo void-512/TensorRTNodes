@@ -16,7 +16,7 @@ def torch_dtype(trt, dtype):
     types = {trt.DataType.FLOAT: torch.float32, trt.DataType.HALF: torch.float16,
              trt.DataType.BF16: torch.bfloat16, trt.DataType.INT32: torch.int32, trt.DataType.INT64: torch.int64}
     if dtype not in types:
-        raise ManifestError(f"Unsupported TensorRT I/O dtype: {dtype}. Quantized engines must expose floating-point I/O.")
+        raise ManifestError(f"Unsupported TensorRT I/O dtype: {dtype}. Use FP32, FP16, or BF16 external bindings.")
     return types[dtype]
 
 
