@@ -16,7 +16,7 @@ import comfy.supported_models
 from comfy.ldm.modules.attention import attention_pytorch
 
 from .manifest import TEMP_ROOT, PRECISIONS, ManifestError, engine_name, load_manifest, package_lock, package_name as default_package_name, publish_engine, source_name
-from .provenance import recover_chain, resolve_source
+from .provenance import capture_dtypes, recover_chain, resolve_source
 from .quantization import export_context, finish_export, load_calibration, modelopt_modules, quantize_linears
 from .runtime import torch_dtype, validate_interface
 
@@ -243,7 +243,7 @@ class ExportTensorRTPackage:
         if precision in {"fp8", "nvfp4"}:
             calibration = load_calibration(calibration_data, width, height)
             modelopt_modules()
-        chain = recover_chain(dynprompt, unique_id)
+        chain = capture_dtypes(recover_chain(dynprompt, unique_id), model, clip, vae)
         expected = Path(resolve_source("checkpoints", chain["base_model"])).resolve()
         for patcher in (model, clip.patcher, vae.patcher):
             factory = patcher.cached_patcher_init

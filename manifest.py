@@ -11,6 +11,7 @@ import re
 
 TEMP_ROOT = Path(__file__).resolve().parents[2] / "dev_temp" / "tensorrt"
 PRECISIONS = ("fp32", "fp16", "bf16", "fp8", "nvfp4")
+SOURCE_DTYPES = ("float32", "float16", "bfloat16", "float8_e4m3fn", "float8_e5m2")
 
 
 class ManifestError(RuntimeError):
@@ -27,9 +28,13 @@ def source_name(value: str) -> str:
 
 
 def validate_chain(chain: dict) -> dict:
-    if not isinstance(chain, dict) or set(chain) != {"base_model", "loras"} or not isinstance(chain["loras"], list):
+    if not isinstance(chain, dict) or set(chain) not in ({"base_model", "loras"}, {"base_model", "loras", "load_dtypes"}) or not isinstance(chain["loras"], list):
         raise ManifestError("Expected a base_model and an ordered loras list.")
     source_name(chain["base_model"])
+    if "load_dtypes" in chain:
+        dtypes = chain["load_dtypes"]
+        if not isinstance(dtypes, dict) or set(dtypes) != {"model", "clip", "vae"} or any(value not in SOURCE_DTYPES for value in dtypes.values()):
+            raise ManifestError("Invalid source MODEL/CLIP/VAE loading dtypes.")
     for item in chain["loras"]:
         if not isinstance(item, dict) or set(item) != {"name", "strength_model", "strength_clip"}:
             raise ManifestError("Each LoRA must contain name, strength_model, and strength_clip.")
@@ -95,9 +100,11 @@ def read_manifest(root: str | Path) -> dict:
         data = json.loads((Path(root) / "manifest.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ManifestError(f"Cannot read TensorRT manifest in {root}: {exc}") from exc
-    if not isinstance(data, dict) or data.get("format_version") != 2:
-        raise ManifestError("Unsupported TensorRT manifest; rebuild old merged-checkpoint packages using format 2.")
+    if not isinstance(data, dict) or data.get("format_version") != 3:
+        raise ManifestError("Unsupported TensorRT manifest; rebuild into a new package_name using format 3 with source dtype provenance.")
     validate_chain(data.get("source"))
+    if "load_dtypes" not in data["source"]:
+        raise ManifestError("Missing source dtype provenance; rebuild the TensorRT package.")
     if not isinstance(data.get("engines"), list) or not data["engines"]:
         raise ManifestError("TensorRT package contains no engines.")
     return data
@@ -141,6 +148,8 @@ def load_manifest(root) -> PackageManifest:
 
 def publish_engine(root, chain, candidate, image_size, precision, requirements, staging):
     validate_chain(chain)
+    if "load_dtypes" not in chain:
+        raise ManifestError("Missing source dtype provenance; rebuild from native MODEL and CLIP inputs.")
     root, staging = Path(root).resolve(), Path(staging)
     with package_lock(root):
         previous = read_manifest(root) if (root / "manifest.json").exists() else None
@@ -152,7 +161,7 @@ def publish_engine(root, chain, candidate, image_size, precision, requirements, 
         engine = root / relative
         if engine.resolve().parent != (root / "engines").resolve() or root not in engine.resolve().parents:
             raise ManifestError("Engine directory escapes its package.")
-        data = {"format_version": 2, "source": chain, "engines": [] if previous is None else [
+        data = {"format_version": 3, "source": chain, "engines": [] if previous is None else [
             item for item in previous["engines"] if item["image_size"] != list(image_size)
         ]}
         data["engines"].append({"path": relative, "image_size": list(image_size), "precision": precision, "requirements": requirements})

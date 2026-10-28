@@ -29,6 +29,7 @@ from comfy_execution.graph import DynamicPrompt, TopologicalSort
 from comfy_execution.validation import validate_node_input
 
 CHAIN = {"base_model": "base.safetensors", "loras": []}
+SOURCE = {**CHAIN, "load_dtypes": {"model": "float32", "clip": "float32", "vae": "float32"}}
 REQ = {"tensorrt_version": "11.4.0.106", "gpu_name": "Test GPU", "compute_capability": [12, 0]}
 
 
@@ -159,6 +160,34 @@ class SourceTests(unittest.TestCase):
             self.assertEqual(result, ("model", None, None))
             load.assert_not_called()
 
+    def test_source_dtypes_capture_and_reconstruct(self):
+        model = Mock()
+        model.model_dtype.return_value = torch.float8_e4m3fn
+        clip = types.SimpleNamespace(cond_stage_model=types.SimpleNamespace(dtypes={torch.float32}))
+        chain = provenance.capture_dtypes(CHAIN, model, clip, types.SimpleNamespace(vae_dtype=torch.float32))
+        self.assertEqual(chain["load_dtypes"], {"model": "float8_e4m3fn", "clip": "float32", "vae": "float32"})
+        with patch.object(provenance, "resolve_source", return_value="checkpoint"), \
+             patch.object(provenance.comfy.sd, "load_checkpoint_guess_config", return_value=("model", "clip", "vae", None)) as load:
+            provenance.reconstruct(chain, output_vae=False)
+        self.assertEqual(load.call_args.kwargs["model_options"]["dtype"], torch.float8_e4m3fn)
+        self.assertEqual(load.call_args.kwargs["te_model_options"]["dtype"], torch.float32)
+
+    def test_mixed_source_clip_dtypes_rejected(self):
+        clip = types.SimpleNamespace(cond_stage_model=types.SimpleNamespace(dtypes={torch.float16, torch.float32}))
+        with self.assertRaisesRegex(manifest.ManifestError, "mixed loading dtypes"):
+            provenance.capture_dtypes(CHAIN, Mock(), clip, types.SimpleNamespace(vae_dtype=torch.float32))
+
+    def test_source_vae_uses_recorded_dtype_and_native_conversion(self):
+        weight = torch.tensor([1.0001], dtype=torch.float32)
+        state = {"first_stage_model.weight": weight, "model.diffusion_model.weight": torch.ones(1)}
+        config = types.SimpleNamespace(vae_key_prefix=["first_stage_model."], process_vae_state_dict=lambda weights: weights)
+        with patch.object(provenance.comfy.sd, "VAE", return_value="vae") as load:
+            self.assertEqual(provenance.source_vae(state, config, {"source": "checkpoint"}, "float32"), "vae")
+        self.assertEqual(load.call_args.kwargs["dtype"], torch.float32)
+        self.assertEqual(set(load.call_args.kwargs["sd"]), {"weight"})
+        self.assertIs(load.call_args.kwargs["sd"]["weight"], weight)
+        self.assertIn("model.diffusion_model.weight", state)
+
 
 class StorageTests(unittest.TestCase):
     def setUp(self):
@@ -172,7 +201,7 @@ class StorageTests(unittest.TestCase):
     def publish(self, size=(1024, 1024), precision="fp16", value=b"engine", chain=CHAIN):
         candidate = self.staging / "candidate.engine"
         candidate.write_bytes(value)
-        manifest.publish_engine(self.root, chain, candidate, size, precision, REQ, self.staging)
+        manifest.publish_engine(self.root, {**chain, "load_dtypes": chain.get("load_dtypes", SOURCE["load_dtypes"])}, candidate, size, precision, REQ, self.staging)
         # Backups are per-build scratch files.
         for name in ("previous.engine", "previous.json"):
             (self.staging / name).unlink(missing_ok=True)
@@ -240,6 +269,28 @@ class StorageTests(unittest.TestCase):
             self.publish(chain={**CHAIN, "loras": [lora()]})
         self.assertEqual(len(manifest.load_manifest(self.root).engines), 1)
 
+    def test_source_dtype_collision(self):
+        self.publish()
+        changed = {**SOURCE, "load_dtypes": {"model": "float16", "clip": "float32", "vae": "float32"}}
+        with self.assertRaisesRegex(manifest.ManifestError, "collision"):
+            self.publish(chain=changed)
+
+    def test_source_dtypes_required_in_manifest(self):
+        self.publish()
+        data = manifest.read_manifest(self.root)
+        del data["source"]["load_dtypes"]
+        (self.root / "manifest.json").write_text(json.dumps(data))
+        with self.assertRaisesRegex(manifest.ManifestError, "dtype provenance"):
+            manifest.load_manifest(self.root)
+
+    def test_older_source_manifest_rejected(self):
+        self.publish()
+        data = manifest.read_manifest(self.root)
+        data["format_version"] = 2
+        (self.root / "manifest.json").write_text(json.dumps(data))
+        with self.assertRaisesRegex(manifest.ManifestError, "new package_name"):
+            manifest.load_manifest(self.root)
+
     def test_concurrent_writer(self):
         with manifest.package_lock(self.root):
             with self.assertRaisesRegex(manifest.ManifestError, "busy"):
@@ -269,8 +320,8 @@ class StorageTests(unittest.TestCase):
 
     def test_invalid_manifest_structures(self):
         self.root.mkdir()
-        for data in ([], None, {"format_version": 2, "source": CHAIN, "engines": None},
-                     {"format_version": 2, "source": CHAIN, "engines": [None]}):
+        for data in ([], None, {"format_version": 3, "source": SOURCE, "engines": None},
+                     {"format_version": 3, "source": SOURCE, "engines": [None]}):
             with self.subTest(data=data):
                 (self.root / "manifest.json").write_text(json.dumps(data))
                 with self.assertRaises(manifest.ManifestError):
@@ -328,6 +379,7 @@ class StorageTests(unittest.TestCase):
                  patch.object(exporter, "_PACKAGE_ROOT", self.root.parent), \
                  patch.object(exporter, "validate_precision"), \
                  patch.object(exporter, "recover_chain", return_value=CHAIN), \
+                 patch.object(exporter, "capture_dtypes", return_value=SOURCE), \
                  patch.object(exporter, "resolve_source", return_value=str(checkpoint)), \
                  patch.object(exporter, "materialize_unet", return_value=exported), \
                  patch.object(exporter, "_export_onnx", side_effect=export_onnx), \
@@ -370,7 +422,7 @@ class SwitcherTests(unittest.TestCase):
 
     def test_release_before_reconstruct_and_repeated(self):
         unet = Mock(spec=loader.TensorRTUNet)
-        unet.package = types.SimpleNamespace(chain=CHAIN)
+        unet.package = types.SimpleNamespace(chain=SOURCE, root=Path("package"))
         engine_model = Mock()
         engine_model.get_model_object.return_value = unet
         events = []
@@ -378,11 +430,21 @@ class SwitcherTests(unittest.TestCase):
         def rebuild(*args, **kwargs):
             events.append("rebuild")
             return "normal", None, None
-        with patch.object(loader.comfy.model_management, "unload_model_and_clones", side_effect=lambda m: events.append("unload")), patch.object(loader, "reconstruct", side_effect=rebuild):
+        with patch.object(loader, "load_manifest", return_value=unet.package), patch.object(loader.comfy.model_management, "unload_model_and_clones", side_effect=lambda m: events.append("unload")), patch.object(loader, "reconstruct", side_effect=rebuild):
             for trigger in (torch.empty(1, 2, 2, 3), {"samples": torch.empty(1)}, "ready", 1, 1.5):
                 result = loader.ModelSwitcher.execute(trigger, engine_model)
                 self.assertEqual(result.result, ("normal",))
                 self.assertEqual(events[-3:], ["release", "unload", "rebuild"])
+
+    def test_changed_package_source_rejected(self):
+        unet = Mock(spec=loader.TensorRTUNet)
+        unet.package = types.SimpleNamespace(chain=SOURCE, root=Path("package"))
+        engine_model = Mock()
+        engine_model.get_model_object.return_value = unet
+        changed = types.SimpleNamespace(chain={**SOURCE, "base_model": "other.safetensors"})
+        with patch.object(loader, "load_manifest", return_value=changed), self.assertRaisesRegex(manifest.ManifestError, "source changed"):
+            loader.ModelSwitcher.execute("ready", engine_model)
+        unet.release.assert_not_called()
 
     def test_wrong_model(self):
         model = Mock()

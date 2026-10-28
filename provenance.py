@@ -6,11 +6,32 @@ from pathlib import Path
 import folder_paths
 import comfy.lora
 import comfy.lora_convert
+import comfy.model_detection
 import comfy.sd
 import comfy.utils
 import nodes
+import torch
 
 from .manifest import ManifestError, source_name, validate_chain
+
+
+TORCH_DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16,
+                "float8_e4m3fn": torch.float8_e4m3fn, "float8_e5m2": torch.float8_e5m2}
+
+
+def capture_dtypes(chain, model, clip, vae):
+    clip_dtypes = clip.cond_stage_model.dtypes
+    if len(clip_dtypes) != 1:
+        raise ManifestError("Cannot reconstruct a source CLIP with mixed loading dtypes.")
+    dtypes = {"model": str(model.model_dtype()).removeprefix("torch."),
+              "clip": str(next(iter(clip_dtypes))).removeprefix("torch."),
+              "vae": str(vae.vae_dtype).removeprefix("torch.")}
+    return validate_chain({**chain, "load_dtypes": dtypes})
+
+
+def source_vae(state, config, metadata, dtype):
+    weights = comfy.utils.state_dict_prefix_replace(state, {key: "" for key in config.vae_key_prefix}, filter_keys=True)
+    return comfy.sd.VAE(sd=config.process_vae_state_dict(weights), metadata=metadata, dtype=TORCH_DTYPES[dtype])
 
 
 def apply_lora(model, clip, lora, strength_model, strength_clip, metadata):
@@ -46,11 +67,21 @@ def reconstruct(chain, *, output_clip=True, output_vae=True, output_model=True, 
     validate_chain(chain)
     checkpoint = resolve_source("checkpoints", chain["base_model"])
     loras = [(item, resolve_source("loras", item["name"])) for item in chain["loras"]]
+    options = {} if model_options is None else model_options.copy()
+    te_options = {}
+    if "load_dtypes" in chain:
+        options["dtype"] = TORCH_DTYPES[chain["load_dtypes"]["model"]]
+        te_options["dtype"] = TORCH_DTYPES[chain["load_dtypes"]["clip"]]
     model, clip, vae, _ = comfy.sd.load_checkpoint_guess_config(
-        checkpoint, output_model=output_model, output_clip=output_clip, output_vae=output_vae,
+        checkpoint, output_model=output_model, output_clip=output_clip, output_vae=output_vae and "load_dtypes" not in chain,
         embedding_directory=folder_paths.get_folder_paths("embeddings"),
-        model_options={} if model_options is None else model_options, disable_dynamic=disable_dynamic,
+        model_options=options, te_model_options=te_options, disable_dynamic=disable_dynamic,
     )
+    if output_vae and "load_dtypes" in chain:
+        state, metadata = comfy.utils.load_torch_file(checkpoint, return_metadata=True)
+        prefix = comfy.model_detection.unet_prefix_from_state_dict(state)
+        config = comfy.model_detection.model_config_from_unet(state, prefix, metadata=metadata)
+        vae = source_vae(state, config, metadata, chain["load_dtypes"]["vae"])
     for item, path in loras:
         if (model is None or item["strength_model"] == 0) and (clip is None or item["strength_clip"] == 0):
             continue

@@ -15,7 +15,7 @@ import comfy.utils
 from comfy_api.latest import io
 
 from .manifest import ManifestError, load_manifest
-from .provenance import apply_lora, reconstruct, resolve_source
+from .provenance import TORCH_DTYPES, apply_lora, reconstruct, resolve_source, source_vae
 from .runtime import TensorRTUNet, TensorRTModelPatcher
 
 
@@ -69,15 +69,17 @@ class LoadTensorRTEngine:
         config = comfy.model_detection.model_config_from_unet(state, prefix, metadata=metadata)
         if type(config) is not comfy.supported_models.SDXL:
             raise ManifestError("TensorRTNodes currently supports base SDXL UNets only.")
+        vae = source_vae(state, config, metadata, manifest.chain["load_dtypes"]["vae"])
         config.unet_config["disable_unet_model_creation"] = True
         config.set_inference_dtype(torch.float32, None)
         base = config.get_model(state, prefix, device=comfy.model_management.unet_offload_device())
         base.diffusion_model = unet
         model = TensorRTModelPatcher(base, load_device=unet.device, offload_device=comfy.model_management.unet_offload_device())
         model.add_callback(comfy.patcher_extension.CallbacksMP.ON_DETACH, lambda patcher, unpatch_all: unet.release())
-        _, clip, vae, _ = comfy.sd.load_state_dict_guess_config(
-            state, output_model=False, output_clip=True, output_vae=True,
+        _, clip, _, _ = comfy.sd.load_state_dict_guess_config(
+            state, output_model=False, output_clip=True, output_vae=False,
             embedding_directory=folder_paths.get_folder_paths("embeddings"), metadata=metadata,
+            te_model_options={"dtype": TORCH_DTYPES[manifest.chain["load_dtypes"]["clip"]]},
         )
         if clip is None or vae is None:
             raise ManifestError("Source checkpoint must provide CLIP and VAE.")
@@ -109,9 +111,12 @@ class ModelSwitcher(io.ComfyNode):
         unet = engine_model.get_model_object("diffusion_model")
         if not isinstance(unet, TensorRTUNet):
             raise ManifestError("Connect the MODEL from Load TensorRT Engine.")
+        manifest = load_manifest(unet.package.root)
+        if manifest.chain != unet.package.chain:
+            raise ManifestError("TensorRT package source changed; reload Load TensorRT Engine before switching models.")
         unet.release()
         comfy.model_management.unload_model_and_clones(engine_model)
-        model, _, _ = reconstruct(unet.package.chain, output_clip=False, output_vae=False)
+        model, _, _ = reconstruct(manifest.chain, output_clip=False, output_vae=False)
         if model is None:
             raise ManifestError("Source checkpoint did not provide a MODEL.")
         return io.NodeOutput(model)

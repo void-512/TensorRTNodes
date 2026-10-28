@@ -6,6 +6,8 @@ Connect native **Load Checkpoint** (`CheckpointLoaderSimple`) and sequential **L
 
 The exporter reads its actual ComfyUI dynamic prompt, follows native loader connections, records filenames and both LoRA strengths in order, and checks the input patchers' checkpoint reload factories. Filenames and strengths must be literal loader settings. Independent MODEL/CLIP branches are combined in a deterministic order, with zero effective strength for an unused component. Unknown transformations, different base checkpoints, and linked source settings fail explicitly; no global loader hooks or manually duplicated source configuration are used.
 
+Version 3 records the actual MODEL, CLIP, and VAE loading dtypes in `source.load_dtypes`. Native reconstruction uses those dtypes even when launch flags change. These describe the supplied source objects; changing engine precision leaves them unchanged. A loading-dtype change requires a separate source package.
+
 | Precision | Graph preparation |
 | --- | --- |
 | `fp32` | FP32 weights and computation graph; preserves TensorRT's default TF32 policy. TF32 execution is not guaranteed for every operation. |
@@ -31,7 +33,7 @@ Arrays must contain finite floating-point values. No random calibration data is 
 
 Patched weights are materialized through ComfyUI's state-dict API into a separate UNet before ONNX tracing, resolving deferred patches without tracing the shared input model. This avoids writing a merged checkpoint. Build candidates, verification tensors, ONNX files, external data, and converted variants live in `dev_temp/tensorrt` and are removed after the operation. Failures retain a diagnostic text file there.
 
-`package_name` selects a folder under `models/tensorrt`; blank uses the checkpoint stem. Choose a separate folder for each different checkpoint/LoRA chain. Existing sources are compared directly, including LoRA order and both strengths; a mismatch is rejected. Precision, resolution, and context profile do not change source identity.
+`package_name` selects a folder under `models/tensorrt`; blank uses the checkpoint stem. Choose a separate folder for each different checkpoint/LoRA chain. Existing sources are compared directly, including LoRA order, both strengths, and source loading dtypes; a mismatch is rejected. Precision, resolution, and context profile do not change source identity.
 
 ```text
 models/tensorrt/selected_model/
@@ -47,9 +49,10 @@ Example manifest:
 
 ```json
 {
-  "format_version": 2,
+  "format_version": 3,
   "source": {
     "base_model": "selected_model.safetensors",
+    "load_dtypes": {"model": "float16", "clip": "float32", "vae": "float32"},
     "loras": [
       {"name": "style.safetensors", "strength_model": 0.8, "strength_clip": 0.6}
     ]
@@ -69,7 +72,7 @@ Example manifest:
 }
 ```
 
-Context profiles and tensor shapes/types are read from the engine itself. Plans require the recorded TensorRT version and GPU model/compute capability. Older manifests are rejected with a rebuild instruction. Manifests contain no weight hashes, fingerprints, merged checkpoint paths, ONNX references, or build history. Keep source files available and unchanged; changing their contents under the same filenames requires rebuilding every resolution in that package.
+Context profiles and tensor shapes/types are read from the engine itself. Plans require the recorded TensorRT version and GPU model/compute capability. Older manifests must be rebuilt into a new package folder; their source loading dtypes cannot be recovered reliably. Manifests contain no weight hashes, fingerprints, merged checkpoint paths, ONNX references, or build history. Keep source files available and unchanged; changing their contents under the same filenames requires rebuilding every resolution in that package.
 
 **Load TensorRT Engine** takes `package` and returns MODEL, CLIP, VAE. It constructs a TensorRT-backed MODEL without loading a duplicate PyTorch UNet into VRAM, loads source CLIP/VAE, and reapplies CLIP LoRAs. Engine I/O is bound using actual FP32/FP16/BF16 tensor types; quantized engines retain floating-point external I/O. Unsupported resolutions and context lengths fail explicitly. Cached wrappers detect engine replacement. ComfyUI offloading releases execution contexts and engine allocations.
 
@@ -105,10 +108,12 @@ Timing used identical inputs, CUDA events and synchronization, three fresh proce
 
 FP8/NVFP4 calibration contained eight real denoising inputs from one prompt and four steps. That is smoke calibration, insufficient to establish production image quality. Their numerical results above are diagnostics only. All five engines deserialized and produced finite `[1,4,128,128]` outputs; the ComfyUI wrapper returned FP32 tensors. Engine inspection confirmed the requested internal types. BF16 was fastest here; FP8 did not improve latency over FP16, and NVFP4 remained slower than BF16. These results do not establish performance at other profiles, optimization levels, or on an idle GPU.
 
-Validation passed 41 regression tests, 10 calibration/quantization tests, and two GPU integration tests. The GPU suite also passed inside a real ComfyUI `PromptExecutor`. Native-loader comparisons matched all 722 patched MODEL tensors and 264 patched CLIP tensors exactly. DynamicVRAM materialization and reconstruction passed with exact checked weights and finite engine output. A fresh 1024×1024 export → load → three-step Euler sampling → VAE decode → Model Switcher run passed, including IMAGE/LATENT/STRING/INT/FLOAT triggers and reuse after release; its first sampler call took 15.678 s including model/context loading. Standalone integration scripts emitted existing ComfyUI patcher destructor warnings at interpreter shutdown.
+Validation passed 48 regression tests, 10 calibration/quantization tests, and two GPU integration tests. The GPU suite also passed inside a real ComfyUI `PromptExecutor`. Native-loader comparisons matched all 722 patched MODEL tensors and 264 patched CLIP tensors exactly. DynamicVRAM materialization and reconstruction passed with exact checked weights and finite engine output. A fresh 1024×1024 export → load → three-step Euler sampling → VAE decode → Model Switcher run passed, including IMAGE/LATENT/STRING/INT/FLOAT triggers and reuse after release; its first sampler call took 15.678 s including model/context loading. Standalone integration scripts emitted existing ComfyUI patcher destructor warnings at interpreter shutdown.
 
 A separate FP16 sampling comparison at 77 and 231 context tokens completed with finite decoded images and released engines. Its three-step latent relative RMSE against native sampling was 3.45% for the short prompt and 3.78% for the long prompt; matching the attention backend gave 4.62% for the short prompt. This exceeded the harness's 3% target, so full-generation numerical equivalence is not established. A real BF16 `PromptExecutor` workflow including checkpoint loading, CLIP encoding, three sampling steps, VAE decoding, and Model Switcher completed in 7.406 s; this was a single cold run.
 
 Two additional fresh-process 1024×1024 `PromptExecutor` workflows completed for every precision, including decoded-image checks and source reconstruction. Median elapsed times from those two runs were FP32 9.988 s, FP16 7.105 s, BF16 6.994 s, FP8 13.262 s, and NVFP4 7.862 s. Shared-GPU variation was substantial; a third-round FP32 attempt failed to allocate its execution context. These few cold runs do not establish steady-state generation throughput.
 
-Raw measurements, scripts, and diagnostics remain under `ComfyUI/dev_temp/tensorrt/review`. Benchmark plans are development artifacts and are not committed. Existing legacy packages are left intact and require rebuilding before use with these nodes.
+A final 1024×1024 workflow passed for all five precisions with launch flags forcing FP8 MODEL loading, FP32 text encoding, and FP16 VAE loading while the recorded source policy was FP32 MODEL, FP16 CLIP, and FP32 VAE. All three recorded dtypes were preserved; decoded images were finite and Model Switcher returned the original MODEL dtype. These were single verification runs, not additional throughput measurements.
+
+Compact measurements, scripts, and diagnostics remain under `ComfyUI/dev_temp/tensorrt/review`. Owned benchmark engines, ONNX intermediates, external data, and calibration arrays were removed after validation. Existing legacy packages are left intact and require rebuilding before use with these nodes.

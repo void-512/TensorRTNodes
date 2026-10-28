@@ -72,7 +72,7 @@ class EngineTests(unittest.TestCase):
                         profile = {"min": 77, "opt": 77 + index, "max": maximum}
                         report = support.exporter._build_engine(onnx, candidate, root / "build.json", 64,
                             profile, (1, 4, 8, 8), 0, precision, root / "verification.pt")
-                        support.manifest.publish_engine(root / "package", support.CHAIN, candidate, (64, 64),
+                        support.manifest.publish_engine(root / "package", support.SOURCE, candidate, (64, 64),
                                                         precision, report["requirements"], root)
                         (root / "previous.engine").unlink(missing_ok=True)
                         (root / "previous.json").unlink(missing_ok=True)
@@ -100,7 +100,7 @@ class EngineTests(unittest.TestCase):
                 onnx = support.exporter._export_onnx(model, root / "second.onnx", 128, 64, 77, "fp16")
                 report = support.exporter._build_engine(onnx, candidate, root / "second.json", 64,
                     {"min": 77, "opt": 77, "max": 154}, (1, 4, 8, 16), 0, "fp16")
-                support.manifest.publish_engine(root / "package", support.CHAIN, candidate, (128, 64),
+                support.manifest.publish_engine(root / "package", support.SOURCE, candidate, (128, 64),
                                                 "fp16", report["requirements"], root)
                 self.assertEqual(len(support.manifest.load_manifest(root / "package").engines), 2)
                 wide = torch.randn(1, 4, 8, 16, device="cuda")
