@@ -3,106 +3,119 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import torch
 import folder_paths
+import comfy.model_detection
 import comfy.model_management
+import comfy.model_patcher
+import comfy.patcher_extension
 import comfy.sd
+import comfy.supported_models
+import comfy.utils
+from comfy_api.latest import io
 
 from .manifest import ManifestError, load_manifest
-from .runtime import TensorRTUNet
+from .provenance import apply_lora, reconstruct, resolve_source
+from .runtime import TensorRTUNet, TensorRTModelPatcher
 
 
 PACKAGE_FOLDER = "tensorrt_packages"
 folder_paths.add_model_folder_path(PACKAGE_FOLDER, os.path.join(folder_paths.models_dir, "tensorrt"), is_default=True)
 
 
-def _packages() -> list[str]:
-    found = []
+def _packages():
+    found = set()
     for root in folder_paths.get_folder_paths(PACKAGE_FOLDER):
-        if not os.path.isdir(root):
-            continue
         for current, _dirs, files in os.walk(root):
             if "manifest.json" in files:
-                found.append(os.path.relpath(current, root).replace("\\", "/"))
-        for child in Path(root).iterdir():
-            if child.is_dir() and (child / "manifest.json").is_file():
-                found.append(child.name)
-    return sorted(set(found))
+                found.add(os.path.relpath(current, root).replace("\\", "/"))
+    return sorted(found)
 
 
-def _resolve_package(name: str) -> Path:
-    if not name or os.path.isabs(name):
-        raise ManifestError("Select a TensorRT package stored under ComfyUI/models/tensorrt.")
+def _resolve_package(name):
+    if not name or Path(name).is_absolute() or "\\" in name or any(p in {"", ".", ".."} for p in name.split("/")):
+        raise ManifestError("Select a package under ComfyUI/models/tensorrt.")
     for root in folder_paths.get_folder_paths(PACKAGE_FOLDER):
-        root = Path(os.path.abspath(root))
-        candidate = Path(os.path.abspath(root / name))
-        if candidate.parent == root or root in candidate.parents:
-            if (candidate / "manifest.json").is_file():
-                return candidate
+        root = Path(root).resolve()
+        candidate = (root / name).resolve()
+        if candidate.is_relative_to(root) and (candidate / "manifest.json").is_file():
+            return candidate
     raise ManifestError(f"TensorRT package not found: {name}")
 
 
 class LoadTensorRTEngine:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"package": (_packages(), {"tooltip": "Package directory under ComfyUI/models/tensorrt."}),
-                              "verify_integrity": ("BOOLEAN", {"default": False, "tooltip": "Hash the checkpoint and engines before loading; slow for large packages."})}}
+        return {"required": {"package": (_packages(),)}}
 
     RETURN_TYPES = ("MODEL", "CLIP", "VAE")
     RETURN_NAMES = ("MODEL", "CLIP", "VAE")
     FUNCTION = "load"
     CATEGORY = "model/loaders"
-    DESCRIPTION = "Loads merged SDXL components and dispatches their UNet to the matching fixed-resolution TensorRT engine."
+    DESCRIPTION = "Loads source CLIP/VAE with ordered LoRAs and a fixed-resolution TensorRT SDXL MODEL."
 
-    def load(self, package: str, verify_integrity: bool):
-        manifest = load_manifest(_resolve_package(package), verify_integrity=verify_integrity)
-        model, clip, vae, _ = comfy.sd.load_checkpoint_guess_config(
-            str(manifest.checkpoint), output_vae=True, output_clip=True,
-            embedding_directory=folder_paths.get_folder_paths("embeddings"),
+    @classmethod
+    def IS_CHANGED(cls, package):
+        root = _resolve_package(package)
+        paths = [root / "manifest.json"] + list((root / "engines").glob("*.engine"))
+        return tuple((str(p), p.stat().st_ino, p.stat().st_mtime_ns, p.stat().st_size) for p in sorted(paths))
+
+    def load(self, package):
+        manifest = load_manifest(_resolve_package(package))
+        unet = TensorRTUNet(manifest)
+        checkpoint = resolve_source("checkpoints", manifest.chain["base_model"])
+        state, metadata = comfy.utils.load_torch_file(checkpoint, return_metadata=True)
+        prefix = comfy.model_detection.unet_prefix_from_state_dict(state)
+        config = comfy.model_detection.model_config_from_unet(state, prefix, metadata=metadata)
+        if type(config) is not comfy.supported_models.SDXL:
+            raise ManifestError("TensorRTNodes currently supports base SDXL UNets only.")
+        config.unet_config["disable_unet_model_creation"] = True
+        config.set_inference_dtype(torch.float32, None)
+        base = config.get_model(state, prefix, device=comfy.model_management.unet_offload_device())
+        base.diffusion_model = unet
+        model = TensorRTModelPatcher(base, load_device=unet.device, offload_device=comfy.model_management.unet_offload_device())
+        model.add_callback(comfy.patcher_extension.CallbacksMP.ON_DETACH, lambda patcher, unpatch_all: unet.release())
+        _, clip, vae, _ = comfy.sd.load_state_dict_guess_config(
+            state, output_model=False, output_clip=True, output_vae=True,
+            embedding_directory=folder_paths.get_folder_paths("embeddings"), metadata=metadata,
         )
-        if model is None or clip is None or vae is None:
-            raise RuntimeError("The TensorRT package checkpoint did not provide MODEL, CLIP, and VAE.")
-        model.add_object_patch("diffusion_model", TensorRTUNet(manifest))
+        if clip is None or vae is None:
+            raise ManifestError("Source checkpoint must provide CLIP and VAE.")
+        for item in manifest.chain["loras"]:
+            path = resolve_source("loras", item["name"])
+            if item["strength_clip"] != 0:
+                lora, lora_metadata = comfy.utils.load_torch_file(path, safe_load=True, return_metadata=True)
+                _, clip = apply_lora(None, clip, lora, 0, item["strength_clip"], lora_metadata)
         return model, clip, vae
 
 
-class LoadMergedModelForDetailer:
-    """Load the normal merged model only after stage-one image selection."""
+class ModelSwitcher(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="ModelSwitcher", display_name="Model Switcher", category="TensorRT/loaders",
+            description="Waits for the trigger, releases this TensorRT engine, and reconstructs its checkpoint and ordered LoRAs.",
+            inputs=[io.AnyType.Input("trigger"), io.Model.Input("engine_model")],
+            outputs=[io.Model.Output(display_name="MODEL")],
+        )
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "image": ("IMAGE", {"tooltip": "Selected image from the TensorRT generation stage."}),
-                "engine_model": ("MODEL", {"tooltip": "MODEL output from Load TensorRT Engine."}),
-            }
-        }
+    def fingerprint_inputs(cls, **kwargs):
+        # Releasing GPU resources must happen on every execution, even with cached triggers.
+        return float("nan")
 
-    RETURN_TYPES = ("MODEL", "IMAGE")
-    RETURN_NAMES = ("MERGED_MODEL", "IMAGE")
-    FUNCTION = "load"
-    CATEGORY = "TensorRT/loaders"
-    DESCRIPTION = "Releases TensorRT, then loads the package's normal merged MODEL for a dynamic-size detailer stage."
-
-    def load(self, image, engine_model):
+    @classmethod
+    def execute(cls, trigger, engine_model):
         unet = engine_model.get_model_object("diffusion_model")
         if not isinstance(unet, TensorRTUNet):
-            raise RuntimeError("Connect the TensorRT MODEL output from Load TensorRT Engine.")
-        checkpoint = unet.checkpoint
-        comfy.model_management.unload_model_and_clones(engine_model)
+            raise ManifestError("Connect the MODEL from Load TensorRT Engine.")
         unet.release()
-        model, _clip, _vae, _ = comfy.sd.load_checkpoint_guess_config(
-            str(checkpoint), output_vae=False, output_clip=False, embedding_directory=[]
-        )
+        comfy.model_management.unload_model_and_clones(engine_model)
+        model, _, _ = reconstruct(unet.package.chain, output_clip=False, output_vae=False)
         if model is None:
-            raise RuntimeError(f"The TensorRT package checkpoint did not provide a MODEL: {checkpoint}")
-        return model, image
+            raise ManifestError("Source checkpoint did not provide a MODEL.")
+        return io.NodeOutput(model)
 
 
-NODE_CLASS_MAPPINGS = {
-    "LoadTensorRTEngine": LoadTensorRTEngine,
-    "LoadMergedModelForDetailer": LoadMergedModelForDetailer,
-}
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "LoadTensorRTEngine": "Load TensorRT Engine",
-    "LoadMergedModelForDetailer": "Load Merged Model for Detailer",
-}
+NODE_CLASS_MAPPINGS = {"LoadTensorRTEngine": LoadTensorRTEngine, "ModelSwitcher": ModelSwitcher}
+NODE_DISPLAY_NAME_MAPPINGS = {"LoadTensorRTEngine": "Load TensorRT Engine", "ModelSwitcher": "Model Switcher"}

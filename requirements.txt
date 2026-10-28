@@ -1,2 +1,2 @@
-tensorrt==11.2.1.2
+tensorrt>=11.0,<12.0
 onnx
