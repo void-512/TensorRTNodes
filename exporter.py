@@ -209,7 +209,6 @@ class ExportTensorRTPackage:
     def INPUT_TYPES(cls):
         return {"required": {
             "model": ("MODEL",), "clip": ("CLIP",), "vae": ("VAE",),
-            "package_name": ("STRING", {"default": "", "tooltip": "Package folder; blank uses the checkpoint name. Use a separate folder for each LoRA chain."}),
             "width": ("INT", {"default": 1024, "min": 64, "max": 16384, "step": 8}),
             "height": ("INT", {"default": 1536, "min": 64, "max": 16384, "step": 8}),
             "maximum_context_length": ("INT", {"default": 462, "min": 77, "max": 2048}),
@@ -217,6 +216,7 @@ class ExportTensorRTPackage:
             "workspace_mib": ("INT", {"default": 1024, "min": 64, "max": 32768, "step": 64}),
             "builder_optimization_level": ("INT", {"default": 3, "min": 0, "max": 5}),
         }, "optional": {"precision": (list(PRECISIONS), {"default": "fp16"}),
+                         "package_name": ("STRING", {"default": "", "tooltip": "Package folder; blank uses the checkpoint name. Use a separate folder for each LoRA chain."}),
                          "calibration_data": ("STRING", {"default": "", "tooltip": "FP8/NVFP4: .npz denoising inputs under ComfyUI/dev_temp. See README for layout."})},
             "hidden": {"dynprompt": "DYNPROMPT", "unique_id": "UNIQUE_ID"}}
 

@@ -394,6 +394,7 @@ class SwitcherTests(unittest.TestCase):
 class PrecisionTests(unittest.TestCase):
     def test_choices(self):
         self.assertEqual(exporter.ExportTensorRTPackage.INPUT_TYPES()["optional"]["precision"][0], list(manifest.PRECISIONS))
+        self.assertEqual(exporter.ExportTensorRTPackage.INPUT_TYPES()["optional"]["package_name"][1]["default"], "")
 
     def test_quantization_refusal(self):
         with self.assertRaisesRegex(manifest.ManifestError, "representative denoising"):
