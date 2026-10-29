@@ -574,6 +574,8 @@ class SwitcherTests(unittest.TestCase):
 
 class PrecisionTests(unittest.TestCase):
     def test_choices(self):
+        self.assertEqual(manifest.PRECISIONS, ("fp32", "fp16", "bf16"))
+        self.assertEqual(set(exporter.DTYPES), set(manifest.PRECISIONS))
         self.assertEqual(exporter.ExportTensorRTPackage.INPUT_TYPES()["optional"]["precision"][0], list(manifest.PRECISIONS))
         self.assertEqual(exporter.ExportTensorRTPackage.INPUT_TYPES()["optional"]["package_name"][1]["default"], "")
         options = exporter.ExportTensorRTPackage.INPUT_TYPES()["optional"]
@@ -591,9 +593,9 @@ class PrecisionTests(unittest.TestCase):
                 with patch.object(exporter.os, "access", return_value=False):
                     self.assertTrue(exporter.ExportTensorRTPackage.INPUT_TYPES()["optional"]["keep_intermediates_in_ram"][1]["read_only"])
 
-    def test_quantization_refusal(self):
-        with self.assertRaisesRegex(manifest.ManifestError, "representative denoising"):
-            exporter.load_calibration("", 64, 64)
+    def test_unsupported_precision(self):
+        with self.assertRaisesRegex(manifest.ManifestError, "Unknown precision"):
+            exporter.validate_precision("int8")
 
     def test_unsupported_hardware(self):
         with patch.object(torch.cuda, "is_available", return_value=True), patch.object(torch.cuda, "get_device_capability", return_value=(7, 5)), patch.object(torch.cuda, "get_device_name", return_value="Turing"):

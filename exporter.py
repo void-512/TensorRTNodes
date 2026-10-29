@@ -20,14 +20,13 @@ from comfy.ldm.modules.attention import attention_pytorch
 
 from .manifest import PRECISIONS, ManifestError, engine_name, load_manifest, package_lock, package_name as default_package_name, publish_engine, source_name
 from .provenance import capture_dtypes, recover_chain, resolve_source
-from .quantization import export_context, finish_export, load_calibration, modelopt_modules, quantize_linears
 from .runtime import torch_dtype, validate_interface
 
 
 _CONTEXT_MIN = 77
 _PACKAGE_ROOT = Path(folder_paths.models_dir) / "tensorrt"
 _RAM_ROOT = Path("/dev/shm")
-DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16, "fp8": torch.float16, "nvfp4": torch.float16}
+DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
 
 
 def ram_intermediates_available():
@@ -46,7 +45,7 @@ def validate_precision(precision):
     if not torch.cuda.is_available():
         raise ManifestError("TensorRT export requires CUDA.")
     capability = torch.cuda.get_device_capability()
-    minimum = {"fp32": (7, 5), "fp16": (7, 5), "bf16": (8, 0), "fp8": (8, 9), "nvfp4": (10, 0)}[precision]
+    minimum = {"fp32": (7, 5), "fp16": (7, 5), "bf16": (8, 0)}[precision]
     if capability < minimum:
         raise ManifestError(f"{precision} requires SM {minimum}; GPU {torch.cuda.get_device_name()} is SM {capability}.")
     return trt
@@ -82,7 +81,7 @@ def materialize_unet(model, precision):
     return exported
 
 
-def _export_onnx(unet, output, width, height, context_length, precision, calibration=None, verification_path=None):
+def _export_onnx(unet, output, width, height, context_length, precision, verification_path=None):
     dtype = DTYPES[precision]
     device = next(unet.parameters()).device
     wrapper = _ExportUNet(unet).eval()
@@ -94,18 +93,13 @@ def _export_onnx(unet, output, width, height, context_length, precision, calibra
         expected = wrapper(latent, timestep, context, adm).detach().cpu()
         torch.save({"inputs": {key: value.cpu() for key, value in zip(("latent", "timestep", "context", "adm"), (latent, timestep, context, adm))},
                     "expected": expected}, verification_path)
-    if precision in {"fp8", "nvfp4"}:
-        if calibration is None:
-            raise ManifestError("Quantized export requires representative denoising calibration data.")
-        quantize_linears(wrapper, precision, calibration)
-    with export_context(wrapper, precision):
-        torch.onnx.export(
-            wrapper, (latent, timestep, context, adm), str(output),
-            input_names=["latent", "timestep", "context", "adm"], output_names=["noise_pred"],
-            opset_version=20 if precision in {"fp8", "nvfp4"} else 18, dynamo=False, external_data=True,
-            dynamic_axes={"context": {1: "context_length"}}, do_constant_folding=True,
-        )
-    return finish_export(output, precision)
+    torch.onnx.export(
+        wrapper, (latent, timestep, context, adm), str(output),
+        input_names=["latent", "timestep", "context", "adm"], output_names=["noise_pred"],
+        opset_version=18, dynamo=False, external_data=True,
+        dynamic_axes={"context": {1: "context_length"}}, do_constant_folding=True,
+    )
+    return output
 
 
 def _build_engine(onnx, engine, report, workspace_mib, context_profile, latent_shape, builder_optimization_level, precision, verification_path=None):
@@ -131,8 +125,7 @@ def _build_engine(onnx, engine, report, workspace_mib, context_profile, latent_s
         counts = Counter(str(network.get_layer(i).get_output(j).dtype)
                          for i in range(network.num_layers) for j in range(network.get_layer(i).num_outputs)
                          if network.get_layer(i).get_output(j) is not None)
-        requested = {"fp32": trt.DataType.FLOAT, "fp16": trt.DataType.HALF, "bf16": trt.DataType.BF16,
-                     "fp8": trt.DataType.FP8, "nvfp4": trt.DataType.FP4}[precision]
+        requested = {"fp32": trt.DataType.FLOAT, "fp16": trt.DataType.HALF, "bf16": trt.DataType.BF16}[precision]
         if not counts[str(requested)]:
             raise ManifestError(f"ONNX graph has no {precision} tensors; actual types: {dict(counts)}")
         config = builder.create_builder_config()
@@ -184,16 +177,15 @@ def _build_engine(onnx, engine, report, workspace_mib, context_profile, latent_s
             expected = verification["expected"].float()
             difference = output - expected
             accuracy = {"max_abs": difference.abs().max().item(), "rmse": difference.square().mean().sqrt().item()}
-            if precision in {"fp32", "fp16", "bf16"}:
-                torch.testing.assert_close(output, expected, rtol=0.15 if precision == "bf16" else 0.03,
-                                           atol=0.1 if precision == "bf16" else 0.02)
+            torch.testing.assert_close(output, expected, rtol=0.15 if precision == "bf16" else 0.03,
+                                       atol=0.1 if precision == "bf16" else 0.02)
         inspector = built.create_engine_inspector()
         inspection = json.loads(inspector.get_engine_information(trt.LayerInformationFormat.JSON))
         layer_types = Counter()
         for layer in inspection["Layers"]:
             for tensor in layer.get("Inputs", []) + layer.get("Outputs", []):
                 layer_types[tensor["Datatype"]] += 1
-        expected_type = {"fp32": "Float", "fp16": "Half", "bf16": "BFloat16", "fp8": "FP8", "nvfp4": "FP4E2M1"}[precision]
+        expected_type = {"fp32": "Float", "fp16": "Half", "bf16": "BFloat16"}[precision]
         if not layer_types[expected_type]:
             raise ManifestError(f"Engine inspector reports no {precision} execution tensors: {dict(layer_types)}")
         # Inspect tensor formats after TensorRT fusion/tactic selection.
@@ -225,7 +217,6 @@ class ExportTensorRTPackage:
             "builder_optimization_level": ("INT", {"default": 3, "min": 0, "max": 5}),
         }, "optional": {"precision": (list(PRECISIONS), {"default": "fp16"}),
                          "package_name": ("STRING", {"default": "", "tooltip": "Package folder; blank uses the checkpoint name. Use a separate folder for each LoRA chain."}),
-                         "calibration_data": ("STRING", {"default": "", "tooltip": "FP8/NVFP4: path to .npz denoising inputs. See README for layout."}),
                          "keep_intermediates_in_ram": ("BOOLEAN", {"default": False, "read_only": not ram_intermediates_available(), "tooltip": "Use RAM-backed /dev/shm for all build intermediates. Locked when shared memory is unavailable. Temporary contents are removed after success or failure."}),
                          "intermediate_directory": ("STRING", {"default": str(_PACKAGE_ROOT / "tmp"), "tooltip": "Temporary disk storage; ignored and locked in RAM mode. Relative paths use the ComfyUI directory. All build files are removed after success or failure."})},
             "hidden": {"dynprompt": "DYNPROMPT", "unique_id": "UNIQUE_ID"}}
@@ -241,7 +232,7 @@ class ExportTensorRTPackage:
         return float("nan")
 
     def convert(self, model, clip, vae, width, height, maximum_context_length, optimization_context_length,
-                workspace_mib, builder_optimization_level, precision="fp16", dynprompt=None, unique_id=None, package_name="", calibration_data="",
+                workspace_mib, builder_optimization_level, precision="fp16", dynprompt=None, unique_id=None, package_name="",
                 keep_intermediates_in_ram=False, intermediate_directory=""):
         validate_precision(precision)
         if width <= 0 or height <= 0 or width % 8 or height % 8:
@@ -250,10 +241,6 @@ class ExportTensorRTPackage:
             raise ManifestError("Context lengths must satisfy 77 <= optimization <= maximum.")
         if not 0 <= builder_optimization_level <= 5 or workspace_mib <= 0:
             raise ManifestError("Builder optimization must be 0-5 and workspace must be positive.")
-        calibration = None
-        if precision in {"fp8", "nvfp4"}:
-            calibration = load_calibration(calibration_data, width, height)
-            modelopt_modules()
         chain = capture_dtypes(recover_chain(dynprompt, unique_id), model, clip, vae)
         expected = Path(resolve_source("checkpoints", chain["base_model"])).resolve()
         for patcher in (model, clip.patcher, vae.patcher):
@@ -290,7 +277,7 @@ class ExportTensorRTPackage:
                     comfy.model_management.load_models_gpu([exported], force_patch_weights=True, force_full_load=True)
                     onnx = staging / "model.onnx"
                     verification_path = staging / "verification.pt"
-                    onnx = _export_onnx(exported.model.diffusion_model, onnx, width, height, optimization_context_length, precision, calibration, verification_path)
+                    onnx = _export_onnx(exported.model.diffusion_model, onnx, width, height, optimization_context_length, precision, verification_path)
                     comfy.model_management.unload_model_and_clones(exported)
                     exported = None
                     gc.collect()
@@ -314,13 +301,11 @@ class ExportTensorRTPackage:
                             comfy.model_management.unload_model_and_clones(exported)
                     finally:
                         exported = None
-                        calibration = None
                         gc.collect()
                         torch.cuda.empty_cache()
         types = result["engine_tensor_types"]
         return {"ui": {"text": [f"TensorRT package: {package}\nRequested {precision}; engine tensor types after fusion: {types}\n"
-                                f"Validation deviation from export model: {result['validation_accuracy']}\n"
-                                "Validation checks execution; quantized image quality depends on representative calibration."]}}
+                                f"Validation deviation from export model: {result['validation_accuracy']}"]}}
 
 
 NODE_CLASS_MAPPINGS = {"ExportTensorRTPackage": ExportTensorRTPackage}

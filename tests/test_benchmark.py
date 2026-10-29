@@ -20,6 +20,17 @@ class BenchmarkTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
 
+    def test_precision_choices_match_supported_engines(self):
+        self.assertEqual(benchmark.PRECISIONS, ("fp32", "fp16", "bf16"))
+        arguments = benchmark.parser().parse_args(["prepare", "--source", "source.json", "--output", "prepared", "--precision", "bf16"])
+        self.assertEqual(arguments.precision, "bf16")
+
+    def test_build_rejects_unsupported_precision_before_loading_cuda(self):
+        prepared = self.root / "prepared.json"
+        prepared.write_text(json.dumps({"precision": "int8"}))
+        with self.assertRaisesRegex(ValueError, "Unsupported engine precision"):
+            benchmark.build(types.SimpleNamespace(prepared=str(prepared)))
+
     def test_statistics_include_tail_and_variability(self):
         result = benchmark.distribution(list(range(1, 101)))
         self.assertEqual(result["count"], 100)
@@ -54,7 +65,7 @@ class BenchmarkTests(unittest.TestCase):
     def test_fused_compute_is_not_counted_as_generic_pointwise(self):
         for metadata, expected in [("[ONNX Layer: /time_embed/Gemm]", "linear"),
                                    ("[ONNX Layer: /block/Conv]", "convolution"),
-                                   ("[ONNX Layer: /ff/MatMul] [ONNX Layer: /weight/DequantizeLinear]", "linear_quantized")]:
+                                   ("[ONNX Layer: /ff/MatMul]", "linear")]:
             self.assertEqual(benchmark.operation_group({"LayerType": "fusion", "Metadata": metadata}), expected)
 
     def test_artifacts_cannot_escape_through_symlinks(self):

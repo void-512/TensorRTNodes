@@ -9,7 +9,8 @@ from pathlib import Path
 import re
 
 
-PRECISIONS = ("fp32", "fp16", "bf16", "fp8", "nvfp4")
+PRECISIONS = ("fp32", "fp16", "bf16")
+# Source loading dtypes follow native ComfyUI checkpoint settings.
 SOURCE_DTYPES = ("float32", "float16", "bfloat16", "float8_e4m3fn", "float8_e5m2")
 
 

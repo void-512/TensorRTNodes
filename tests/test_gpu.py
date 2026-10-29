@@ -11,7 +11,6 @@ import sys
 import tempfile
 import unittest
 
-import numpy as np
 import test_regressions as support
 import torch
 
@@ -54,20 +53,15 @@ class EngineTests(unittest.TestCase):
             timestep = torch.tensor([500., 700.], device="cuda")
             context = torch.randn(2, 100, 2048, device="cuda")
             adm = torch.randn(2, 2816, device="cuda")
-            calibration = {"latent": x[:1].cpu().numpy()[None], "timestep": timestep[:1].cpu().numpy()[None],
-                           "context": context[:1, :77].cpu().numpy()[None], "adm": adm[:1].cpu().numpy()[None]}
-            # Deterministic synthetic calibration tests Q/DQ mechanics, not model quality.
-            calibration = {key: np.repeat(value, 2, axis=0) for key, value in calibration.items()}
             runtime = None
             try:
-                for index, precision in enumerate(os.environ.get("TENSORRT_TEST_PRECISIONS", "fp32,fp16,bf16,fp8,nvfp4").split(",")):
+                for index, precision in enumerate(os.environ.get("TENSORRT_TEST_PRECISIONS", ",".join(support.manifest.PRECISIONS)).split(",")):
                     with self.subTest(precision=precision):
                         model = SmallUNet().to(device="cuda", dtype=support.exporter.DTYPES[precision])
                         model.load_state_dict(copy.deepcopy(state))
                         candidate = root / "candidate.engine"
                         onnx = support.exporter._export_onnx(model, root / f"{precision}.onnx", 64, 64, 77, precision,
-                                                             calibration if precision in {"fp8", "nvfp4"} else None,
-                                                             root / "verification.pt")
+                                                             verification_path=root / "verification.pt")
                         maximum = 154 + index
                         profile = {"min": 77, "opt": 77 + index, "max": maximum}
                         report = support.exporter._build_engine(onnx, candidate, root / "build.json", 64,

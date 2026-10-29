@@ -11,7 +11,6 @@ import csv
 import gc
 import hashlib
 import importlib
-import importlib.metadata
 import json
 import math
 import os
@@ -37,6 +36,7 @@ GPU_FIELDS = ("uuid", "name", "driver_version", "utilization.gpu", "utilization.
               "clocks_event_reasons.sw_power_cap", "clocks_event_reasons.hw_thermal_slowdown",
               "clocks_event_reasons.hw_power_brake_slowdown")
 DTYPES = {trt.DataType.FLOAT: torch.float32, trt.DataType.HALF: torch.float16, trt.DataType.BF16: torch.bfloat16}
+PRECISIONS = ("fp32", "fp16", "bf16")
 
 
 def artifact_path(value):
@@ -208,14 +208,9 @@ def input_signature(inputs):
 
 
 def prepare(args):
-    if args.modelopt_cuda:
-        # Explicit diagnostic process setting; never change a running server's backend.
-        importlib.import_module("modelopt.torch.quantization.tensor_quant").DISABLE_TRITON_KERNEL = True
     modules = project_modules()
     source = json.loads(Path(args.source).read_text())
     source = source.get("source", source)
-    if args.precision in {"fp8", "nvfp4"} and args.export_device != "cuda":
-        raise ValueError("Quantized preparation requires --export-device cuda for calibration")
     root = artifact_path(args.output)
     root.mkdir(parents=True, exist_ok=True)
     torch.set_grad_enabled(False)
@@ -235,21 +230,15 @@ def prepare(args):
     print("Computing native reference", flush=True)
     expected = modules["exporter"]._ExportUNet(unet)(*converted).detach().cpu()
     torch.save({"inputs": inputs, "expected": expected}, root / "verification.pt")
-    calibration = (modules["exporter"].load_calibration(args.calibration, args.width, args.height)
-                   if args.precision in {"fp8", "nvfp4"} else None)
     started = time.perf_counter()
     print("Exporting ONNX", flush=True)
     graph = modules["exporter"]._export_onnx(unet, root / "model.onnx", args.width, args.height, args.context,
-                                               args.precision, calibration)
+                                               args.precision)
     metadata = {"source": source, "precision": args.precision, "width": args.width, "height": args.height,
                 "context": args.context, "seed": args.seed, "export_device": args.export_device,
                 "onnx": str(graph), "verification": str(root / "verification.pt"),
                 "export_seconds": time.perf_counter() - started, "graph": graph_summary(graph)}
     metadata["software"] = {"torch": torch.__version__, "onnx": onnx.__version__}
-    if calibration is not None:
-        metadata["calibration"] = {"path": str(Path(args.calibration).resolve()), "samples": len(calibration["latent"])}
-        metadata["calibration"]["modelopt_cuda_backend"] = args.modelopt_cuda
-        metadata["software"].update({name: importlib.metadata.version(name) for name in ("nvidia-modelopt", "triton")})
     write_json(root / "prepared.json", metadata)
     print(json.dumps({key: metadata[key] for key in ("precision", "export_seconds", "onnx")}), flush=True)
 
@@ -317,6 +306,8 @@ def inspection(engine):
 
 def build(args):
     prepared = json.loads(Path(args.prepared).read_text())
+    if prepared["precision"] not in PRECISIONS:
+        raise ValueError(f"Unsupported engine precision: {prepared['precision']}")
     output = artifact_path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     if (output / "build.json").exists():
@@ -419,14 +410,10 @@ def operation_group(layer):
               any(word in metadata for word in ("/matmul", "/gemm")))
     if "attn" in metadata and "softmax" in metadata:
         return "attention_fused" if "gemm_mha" in layer.get("TacticName", "") else "attention_softmax"
-    if matrix and "quantiz" in metadata:
-        return "linear_quantized"
     if layer.get("LayerType") == "correlation" or (layer.get("LayerType") == "fusion" and "/conv" in metadata):
         return "convolution"
     if matrix:
         return "attention_matrix" if "/attn" in metadata and "/to_" not in metadata else "linear"
-    if "quantiz" in metadata:
-        return "quantization"
     if any(word in metadata for word in ("normalization", "layernorm", "instancenorm")):
         return "normalization/fused_pointwise"
     if layer.get("LayerType") in {"cast", "reshape"} or "reformat" in metadata:
@@ -694,14 +681,12 @@ def parser():
     p = commands.add_parser("prepare", help="Materialize the source and export one graph")
     p.add_argument("--source", required=True)
     p.add_argument("--output", required=True)
-    p.add_argument("--precision", choices=("fp32", "fp16", "bf16", "fp8", "nvfp4"), required=True)
+    p.add_argument("--precision", choices=PRECISIONS, required=True)
     p.add_argument("--width", type=int, default=1024)
     p.add_argument("--height", type=int, default=1024)
     p.add_argument("--context", type=int, default=77)
     p.add_argument("--seed", type=int, default=812)
     p.add_argument("--export-device", choices=("cpu", "cuda"), default="cpu")
-    p.add_argument("--calibration", default="")
-    p.add_argument("--modelopt-cuda", action="store_true", help="Use ModelOpt's CUDA quantization backend in this diagnostic process")
     p.add_argument("--threads", type=int, default=8)
     p.set_defaults(function=prepare)
     p = commands.add_parser("build", help="Compile an isolated diagnostic engine and timing cache")
@@ -743,7 +728,7 @@ def parser():
     p.set_defaults(function=compare)
     p = commands.add_parser("native", help="Measure native PyTorch with the export attention contract")
     p.add_argument("--prepared", required=True)
-    p.add_argument("--precision", choices=("fp32", "fp16", "bf16"), required=True)
+    p.add_argument("--precision", choices=PRECISIONS, required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--warmups", type=int, default=20)
     p.add_argument("--repetitions", type=int, default=100)
@@ -758,7 +743,7 @@ def parser():
     group.add_argument("--prepared")
     p.add_argument("--dataset", required=True)
     p.add_argument("--indices", help="Comma-separated sample indices; defaults to every recorded sample")
-    p.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="fp32")
+    p.add_argument("--precision", choices=PRECISIONS, default="fp32")
     p.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     p.add_argument("--reference")
     p.add_argument("--save-output", required=True)
