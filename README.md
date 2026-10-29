@@ -18,7 +18,7 @@ Version 3 records the actual MODEL, CLIP, and VAE loading dtypes in `source.load
 
 This follows NVIDIA's [TensorRT 11 migration guide](https://docs.nvidia.com/deeplearning/tensorrt/latest/api/migration/tensorrt-10x-to-11x-python-api-patterns.html), [precision control documentation](https://docs.nvidia.com/deeplearning/tensorrt/11.4.0/inference-library/precision-control.html), and [ModelOpt diffusion export workflow](https://github.com/NVIDIA/Model-Optimizer/blob/main/examples/diffusers/quantization/ONNX-TRT-Deployment.md).
 
-Quantization optionally requires `nvidia-modelopt[onnx]==0.47.0`, a CUDA toolkit, and Ninja. Install these in the environment used to run ComfyUI only when needed. The test environment was isolated under `dev_temp`; the existing PyTorch/CUDA/TensorRT installation was preserved. ModelOpt 0.47's NVFP4 Triton kernel fails with the installed Triton 3.9 because block pointers were removed. A separate Triton 3.6 experiment validates that export path, but conflicts with PyTorch 2.15's declared Triton dependency and is not a recommended production environment.
+Quantization optionally requires `nvidia-modelopt[onnx]==0.47.0`, a CUDA toolkit, and Ninja. Install these in the environment used to run ComfyUI only when needed. The test environment was isolated under `dev_temp`; the existing PyTorch/CUDA/TensorRT installation was preserved. ModelOpt 0.47's NVFP4 Triton kernel fails with the installed Triton 3.9 because block pointers were removed; 0.48rc1 still has that failure. The standalone benchmark's explicit `--modelopt-cuda` preparation mode passed full NVFP4 export/build/inference using the SDK CUDA backend with ModelOpt 0.47, PyTorch 2.15 and Triton 3.9 unchanged. Production nodes do not override SDK-global backend settings. The earlier Triton 3.6 experiment conflicts with PyTorch 2.15's declared dependency and is not a recommended production environment.
 
 For FP8/NVFP4, supply the optional `calibration_data` filename pointing to an existing `.npz` under `ComfyUI/dev_temp`. Use inputs captured from representative denoising calls with this checkpoint and LoRA chain, including positive/negative conditioning, multiple prompts, and denoising timesteps. Arrays must have a leading sample dimension:
 
@@ -85,12 +85,15 @@ Run tests with ComfyUI's Python from the ComfyUI root:
 ```sh
 python custom_nodes/TensorRTNodes/tests/test_regressions.py
 python custom_nodes/TensorRTNodes/tests/test_quantization.py
+python custom_nodes/TensorRTNodes/tests/test_benchmark.py
 TENSORRT_TEST_GPU=1 python custom_nodes/TensorRTNodes/tests/test_gpu.py
 ```
 
 GPU tests build small synthetic engines and test precision inspection, dynamic contexts, batching, replacement, output types, and repeated release/reload. They are not SDXL benchmarks. Set `TENSORRT_TEST_PRECISIONS=fp32,fp16,bf16` to test a subset when optional quantization dependencies are unavailable. Test artifacts stay under `dev_temp/tensorrt`.
 
 ## Validation and measured performance
+
+The follow-up [performance investigation](PERFORMANCE.md) includes a reusable `benchmark.py` CLI, contention logs, graph/tactic comparisons, held-out numerical checks and matched builder experiments. On the same 1024×1024 workload, optimization level 3 reduced FP16 from 100.16 to 25.52 ms and NVFP4 from 65.42 to 22.31 ms; BF16 measured 25.90 ms. Preserving Half attention in FP8 Linear exports restores fused MHA and improves level-0 latency from 101.00 to 84.13 ms; rebuild FP8 engines to use this change. These observed-idle shared-GPU measurements use different conditions from the historical table below. FP8 level-3 builds produced nonfinite outputs and remain unresolved. Quantized generation drift remains substantial, so speed does not establish production image quality. The existing UI defaults remain level 3 and 1024 MiB workspace.
 
 Validated on 2026-10-28 with an RTX PRO 6000 Blackwell Server Edition (SM 12.0), TensorRT 11.4.0.106, PyTorch 2.15.0+cu132, ONNX 1.23.2, and driver 615.71.10. Quantization used ModelOpt 0.47.0; NVFP4 export required the isolated Triton 3.6 experiment described above. The implementation follows TensorRT 11's [strongly typed graph and explicit quantization requirements](https://docs.nvidia.com/deeplearning/tensorrt/latest/api/migration/tensorrt-10x-to-11x-python-api-patterns.html).
 
