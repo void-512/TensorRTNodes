@@ -5,7 +5,9 @@ from collections import Counter
 from contextlib import ExitStack
 import gc
 import json
+import os
 from pathlib import Path
+import shutil
 import tempfile
 import traceback
 
@@ -26,6 +28,10 @@ _CONTEXT_MIN = 77
 _PACKAGE_ROOT = Path(folder_paths.models_dir) / "tensorrt"
 _RAM_ROOT = Path("/dev/shm")
 DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16, "fp8": torch.float16, "nvfp4": torch.float16}
+
+
+def ram_intermediates_available():
+    return _RAM_ROOT.is_dir() and os.access(_RAM_ROOT, os.W_OK | os.X_OK)
 
 
 def validate_precision(precision):
@@ -220,8 +226,8 @@ class ExportTensorRTPackage:
         }, "optional": {"precision": (list(PRECISIONS), {"default": "fp16"}),
                          "package_name": ("STRING", {"default": "", "tooltip": "Package folder; blank uses the checkpoint name. Use a separate folder for each LoRA chain."}),
                          "calibration_data": ("STRING", {"default": "", "tooltip": "FP8/NVFP4: path to .npz denoising inputs. See README for layout."}),
-                         "keep_intermediates_in_ram": ("BOOLEAN", {"default": False, "tooltip": "Keep temporary ONNX graphs and exported weights in RAM-backed /dev/shm during generation. Requires sufficient shared memory; files are removed afterward."}),
-                         "intermediate_directory": ("STRING", {"default": str(_PACKAGE_ROOT / "tmp"), "tooltip": "Directory for disk intermediates and failure diagnostics. Relative paths use the ComfyUI directory."})},
+                         "keep_intermediates_in_ram": ("BOOLEAN", {"default": False, "read_only": not ram_intermediates_available(), "tooltip": "Use RAM-backed /dev/shm for all build intermediates. Locked when shared memory is unavailable. Temporary contents are removed after success or failure."}),
+                         "intermediate_directory": ("STRING", {"default": str(_PACKAGE_ROOT / "tmp"), "tooltip": "Temporary disk storage; ignored and locked in RAM mode. Relative paths use the ComfyUI directory. All build files are removed after success or failure."})},
             "hidden": {"dynprompt": "DYNPROMPT", "unique_id": "UNIQUE_ID"}}
 
     RETURN_TYPES = ()
@@ -260,30 +266,30 @@ class ExportTensorRTPackage:
         package = (root / selected_name).resolve()
         if package.parent != root:
             raise ManifestError("Package path escapes the TensorRT model directory.")
-        temporary_root = Path(intermediate_directory).expanduser() if intermediate_directory else root / "tmp"
-        if not temporary_root.is_absolute():
-            temporary_root = Path(folder_paths.base_path) / temporary_root
-        temporary_root = temporary_root.resolve()
-        temporary_root.mkdir(parents=True, exist_ok=True)
-        if keep_intermediates_in_ram and not _RAM_ROOT.is_dir():
-            raise ManifestError("RAM intermediates require /dev/shm. Disable keep_intermediates_in_ram or select a RAM disk as intermediate_directory.")
+        if keep_intermediates_in_ram:
+            if not ram_intermediates_available():
+                raise ManifestError("RAM intermediates are unavailable: /dev/shm must exist and be writable. Disable keep_intermediates_in_ram.")
+            temporary_root = _RAM_ROOT
+        else:
+            temporary_root = Path(intermediate_directory).expanduser() if intermediate_directory else root / "tmp"
+            if not temporary_root.is_absolute():
+                temporary_root = Path(folder_paths.base_path) / temporary_root
+            temporary_root = temporary_root.resolve()
+            temporary_root.mkdir(parents=True, exist_ok=True)
         with package_lock(str(package) + ".build"):
             if package.exists() and load_manifest(package).chain != chain:
                 raise ManifestError("Existing package belongs to a different model chain. Select a different package_name for this checkpoint/LoRA configuration.")
             with ExitStack() as stack:
-                staging = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="build-", dir=temporary_root)))
-                intermediates = staging
-                if keep_intermediates_in_ram:
-                    intermediates = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="comfy-tensorrt-", dir=_RAM_ROOT)))
-                publication = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix=".publish-", dir=root)))
-                candidate = publication / engine_name(chain, width, height)
+                prefix = "comfy-tensorrt-" if keep_intermediates_in_ram else "build-"
+                staging = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix=prefix, dir=temporary_root)))
+                candidate = staging / engine_name(chain, width, height)
                 report = staging / "build.json"
                 exported = None
                 try:
                     exported = materialize_unet(model, precision)
                     comfy.model_management.load_models_gpu([exported], force_patch_weights=True, force_full_load=True)
-                    onnx = intermediates / "model.onnx"
-                    verification_path = intermediates / "verification.pt"
+                    onnx = staging / "model.onnx"
+                    verification_path = staging / "verification.pt"
                     onnx = _export_onnx(exported.model.diffusion_model, onnx, width, height, optimization_context_length, precision, calibration, verification_path)
                     comfy.model_management.unload_model_and_clones(exported)
                     exported = None
@@ -292,16 +298,25 @@ class ExportTensorRTPackage:
                     profile = {"min": _CONTEXT_MIN, "opt": optimization_context_length, "max": maximum_context_length}
                     result = _build_engine(onnx, candidate, report, workspace_mib, profile,
                                            (1, 4, height // 8, width // 8), builder_optimization_level, precision, verification_path)
-                    publish_engine(package, chain, candidate, (width, height), precision, result["requirements"], publication)
-                except Exception:
-                    diagnostic = temporary_root / (staging.name + "-failure.txt")
-                    diagnostic.write_text((report.read_text() if report.exists() else "") + "\n" + traceback.format_exc(), encoding="utf-8")
-                    raise ManifestError(f"TensorRT {precision} export failed. Diagnostics: {diagnostic}\n{traceback.format_exc().splitlines()[-1]}")
+                    publication = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix=".publish-", dir=root)))
+                    output = publication / candidate.name
+                    shutil.move(str(candidate), str(output))
+                    publish_engine(package, chain, output, (width, height), precision, result["requirements"], publication)
+                except BaseException as error:
+                    # Failed tracing/build frames can retain the materialized UNet.
+                    traceback.clear_frames(error.__traceback__)
+                    if not isinstance(error, Exception):
+                        raise
+                    raise ManifestError(f"TensorRT {precision} export failed: {error}") from error
                 finally:
-                    if exported is not None:
-                        comfy.model_management.unload_model_and_clones(exported)
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                    try:
+                        if exported is not None:
+                            comfy.model_management.unload_model_and_clones(exported)
+                    finally:
+                        exported = None
+                        calibration = None
+                        gc.collect()
+                        torch.cuda.empty_cache()
         types = result["engine_tensor_types"]
         return {"ui": {"text": [f"TensorRT package: {package}\nRequested {precision}; engine tensor types after fusion: {types}\n"
                                 f"Validation deviation from export model: {result['validation_accuracy']}\n"

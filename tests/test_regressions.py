@@ -359,49 +359,85 @@ class StorageTests(unittest.TestCase):
             self.publish(value=b"replaced", precision="fp32")
             self.assertNotEqual(before, loader.LoadTensorRTEngine.IS_CHANGED("package"))
 
-    def test_failed_export_or_build_preserves_package_and_cleans_artifacts(self):
+    def test_failed_generation_preserves_package_and_cleans_all_artifacts(self):
         self.publish(value=b"working")
         previous = (self.root / "manifest.json").read_bytes()
-        scratch = self.staging / "builds"
         checkpoint = self.staging / "base.safetensors"
         patcher = Mock(cached_patcher_init=(None, (str(checkpoint),)))
         exported = Mock()
         ram = self.staging / "ram"
         ram.mkdir()
+        move_original = exporter.shutil.move
 
-        for failure, keep_in_ram in (("export", False), ("build", False), ("export", True), ("build", True)):
-            def export_onnx(unet, output, *args):
-                self.assertEqual(output.parent.parent, ram if keep_in_ram else scratch)
-                output.write_bytes(b"temporary graph")
-                output.with_suffix(".data").write_bytes(b"temporary weights")
-                if failure == "export":
-                    raise RuntimeError("injected export failure")
-                return output
+        for keep_in_ram in (False, True):
+            for failure in ("materialize", "load", "export", "unload", "build", "move", "publish", "cancel"):
+                scratch = self.staging / f"{failure}-{keep_in_ram}"
+                unloaded = []
 
-            with self.subTest(failure=failure, ram=keep_in_ram), \
-                 patch.object(exporter, "_PACKAGE_ROOT", self.root.parent), \
-                 patch.object(exporter, "_RAM_ROOT", ram), \
-                 patch.object(exporter, "validate_precision"), \
-                 patch.object(exporter, "recover_chain", return_value=CHAIN), \
-                 patch.object(exporter, "capture_dtypes", return_value=SOURCE), \
-                 patch.object(exporter, "resolve_source", return_value=str(checkpoint)), \
-                 patch.object(exporter, "materialize_unet", return_value=exported), \
-                 patch.object(exporter, "_export_onnx", side_effect=export_onnx), \
-                 patch.object(exporter, "_build_engine", side_effect=RuntimeError("injected build failure")), \
-                 patch.object(exporter.comfy.model_management, "load_models_gpu"), \
-                 patch.object(exporter.comfy.model_management, "unload_model_and_clones"), \
-                 patch.object(torch.cuda, "empty_cache"), \
-                 self.assertRaisesRegex(manifest.ManifestError, f"injected {failure} failure"):
-                exporter.ExportTensorRTPackage().convert(
-                    patcher, types.SimpleNamespace(patcher=patcher), types.SimpleNamespace(patcher=patcher),
-                    1024, 1024, 154, 77, 256, 0, package_name=self.root.name, intermediate_directory=str(scratch),
-                    keep_intermediates_in_ram=keep_in_ram,
-                )
-            self.assertEqual((self.root / "manifest.json").read_bytes(), previous)
-            self.assertEqual(manifest.load_manifest(self.root).engines[0].path.read_bytes(), b"working")
-            self.assertTrue(all(path.suffix == ".txt" for path in scratch.iterdir()))
-            self.assertEqual(list(ram.iterdir()), [])
-            self.assertEqual(list(self.root.parent.glob(".publish-*")), [])
+                def export_onnx(unet, output, *args):
+                    self.assertEqual(output.parent.parent, ram if keep_in_ram else scratch)
+                    output.write_bytes(b"temporary graph")
+                    output.with_suffix(".data").write_bytes(b"temporary weights")
+                    (output.parent / "merged.safetensors").write_bytes(b"merged weights")
+                    args[-1].write_bytes(b"verification")
+                    if failure == "export":
+                        raise RuntimeError("injected export failure")
+                    if failure == "cancel":
+                        raise KeyboardInterrupt("injected cancel failure")
+                    return output
+
+                def unload(model):
+                    unloaded.append(model)
+                    if failure == "unload" and len(unloaded) == 1:
+                        raise RuntimeError("injected unload failure")
+
+                def build(onnx, candidate, report, *args):
+                    self.assertEqual(candidate.parent, onnx.parent)
+                    self.assertEqual(report.parent, onnx.parent)
+                    candidate.write_bytes(b"candidate engine")
+                    report.write_text("build report")
+                    if failure == "build":
+                        raise RuntimeError("injected build failure")
+                    return {"requirements": REQ}
+
+                def move(src, dst):
+                    if failure == "move":
+                        Path(dst).write_bytes(b"partial engine copy")
+                        raise RuntimeError("injected move failure")
+                    return move_original(src, dst)
+
+                exception = KeyboardInterrupt if failure == "cancel" else manifest.ManifestError
+                with self.subTest(failure=failure, ram=keep_in_ram), \
+                     patch.object(exporter, "_PACKAGE_ROOT", self.root.parent), \
+                     patch.object(exporter, "_RAM_ROOT", ram), \
+                     patch.object(exporter, "validate_precision"), \
+                     patch.object(exporter, "recover_chain", return_value=CHAIN), \
+                     patch.object(exporter, "capture_dtypes", return_value=SOURCE), \
+                     patch.object(exporter, "resolve_source", return_value=str(checkpoint)), \
+                     patch.object(exporter, "materialize_unet", return_value=exported,
+                                  side_effect=RuntimeError("injected materialize failure") if failure == "materialize" else None), \
+                     patch.object(exporter, "_export_onnx", side_effect=export_onnx), \
+                     patch.object(exporter, "_build_engine", side_effect=build), \
+                     patch.object(exporter.shutil, "move", side_effect=move), \
+                     patch.object(exporter, "publish_engine", side_effect=RuntimeError("injected publish failure")), \
+                     patch.object(exporter.comfy.model_management, "load_models_gpu",
+                                  side_effect=RuntimeError("injected load failure") if failure == "load" else None), \
+                     patch.object(exporter.comfy.model_management, "unload_model_and_clones", side_effect=unload), \
+                     patch.object(torch.cuda, "empty_cache"), \
+                     self.assertRaisesRegex(exception, f"injected {failure} failure"):
+                    exporter.ExportTensorRTPackage().convert(
+                        patcher, types.SimpleNamespace(patcher=patcher), types.SimpleNamespace(patcher=patcher),
+                        1024, 1024, 154, 77, 256, 0, package_name=self.root.name, intermediate_directory=str(scratch),
+                        keep_intermediates_in_ram=keep_in_ram,
+                    )
+                self.assertEqual((self.root / "manifest.json").read_bytes(), previous)
+                self.assertEqual(manifest.load_manifest(self.root).engines[0].path.read_bytes(), b"working")
+                if keep_in_ram:
+                    self.assertFalse(scratch.exists())
+                else:
+                    self.assertEqual(list(scratch.iterdir()), [])
+                self.assertEqual(list(ram.iterdir()), [])
+                self.assertEqual(list(self.root.parent.glob(".publish-*")), [])
 
     def test_export_storage_paths_and_atomic_publication(self):
         checkpoint = self.staging / "base.safetensors"
@@ -411,7 +447,8 @@ class StorageTests(unittest.TestCase):
         paths = [(False, "", self.root.parent / "tmp"),
                  (False, str(self.staging / "disk"), self.staging / "disk"),
                  (False, "relative", self.staging / "relative"),
-                 (True, str(self.staging / "disk"), self.staging / "disk")]
+                 (True, str(self.staging / "unused"), ram),
+                 (True, "\0ignored", ram)]
         for keep_in_ram, directory, expected in paths:
             exported = Mock()
             observed = []
@@ -427,9 +464,8 @@ class StorageTests(unittest.TestCase):
             def build(onnx, candidate, report, *args):
                 self.assertTrue(onnx.is_file())
                 self.assertTrue(args[-1].is_file())
-                self.assertEqual(candidate.parent.parent, self.root.parent)
-                self.assertEqual(report.parent.parent, expected)
-                self.assertNotEqual(candidate.parent, onnx.parent)
+                self.assertEqual(candidate.parent, onnx.parent)
+                self.assertEqual(report.parent, onnx.parent)
                 candidate.write_bytes(b"new engine")
                 report.write_text("{}")
                 return {"requirements": REQ, "engine_tensor_types": {"Half": 1}, "validation_accuracy": {"rmse": 0}}
@@ -458,6 +494,26 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(list(expected.iterdir()), [])
             self.assertEqual(list(ram.iterdir()), [])
             self.assertEqual(list(self.root.parent.glob(".publish-*")), [])
+            self.assertFalse((self.staging / "unused").exists())
+
+    def test_unavailable_ram_rejects_api_requests_without_creating_disk_intermediates(self):
+        checkpoint = self.staging / "base.safetensors"
+        patcher = Mock(cached_patcher_init=(None, (str(checkpoint),)))
+        ignored = self.staging / "ignored"
+        with patch.object(exporter, "_PACKAGE_ROOT", self.root.parent), \
+             patch.object(exporter, "_RAM_ROOT", self.staging / "missing-ram"), \
+             patch.object(exporter, "validate_precision"), \
+             patch.object(exporter, "recover_chain", return_value=CHAIN), \
+             patch.object(exporter, "capture_dtypes", return_value=SOURCE), \
+             patch.object(exporter, "resolve_source", return_value=str(checkpoint)), \
+             patch.object(exporter, "materialize_unet") as materialize, \
+             self.assertRaisesRegex(manifest.ManifestError, "RAM intermediates are unavailable"):
+            exporter.ExportTensorRTPackage().convert(
+                patcher, types.SimpleNamespace(patcher=patcher), types.SimpleNamespace(patcher=patcher),
+                64, 64, 154, 77, 64, 0, keep_intermediates_in_ram=True, intermediate_directory=str(ignored),
+            )
+        materialize.assert_not_called()
+        self.assertFalse(ignored.exists())
 
 
 class SwitcherTests(unittest.TestCase):
@@ -524,6 +580,17 @@ class PrecisionTests(unittest.TestCase):
         self.assertFalse(options["keep_intermediates_in_ram"][1]["default"])
         self.assertEqual(Path(options["intermediate_directory"][1]["default"]), exporter._PACKAGE_ROOT / "tmp")
 
+    def test_ram_control_is_locked_when_shared_memory_is_unavailable(self):
+        TEST_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as temporary:
+            ram = Path(temporary) / "ram"
+            with patch.object(exporter, "_RAM_ROOT", ram):
+                self.assertTrue(exporter.ExportTensorRTPackage.INPUT_TYPES()["optional"]["keep_intermediates_in_ram"][1]["read_only"])
+                ram.mkdir()
+                self.assertFalse(exporter.ExportTensorRTPackage.INPUT_TYPES()["optional"]["keep_intermediates_in_ram"][1]["read_only"])
+                with patch.object(exporter.os, "access", return_value=False):
+                    self.assertTrue(exporter.ExportTensorRTPackage.INPUT_TYPES()["optional"]["keep_intermediates_in_ram"][1]["read_only"])
+
     def test_quantization_refusal(self):
         with self.assertRaisesRegex(manifest.ManifestError, "representative denoising"):
             exporter.load_calibration("", 64, 64)
@@ -535,6 +602,45 @@ class PrecisionTests(unittest.TestCase):
 
 
 class MemoryTests(unittest.TestCase):
+    def test_failed_export_does_not_retain_merged_weights_in_traceback(self):
+        TEST_ROOT.mkdir(parents=True, exist_ok=True)
+        references = []
+
+        def materialize(model, precision):
+            unet = torch.nn.Linear(2, 2)
+            references.extend((weakref.ref(unet), weakref.ref(unet.weight)))
+            return types.SimpleNamespace(model=types.SimpleNamespace(diffusion_model=unet))
+
+        def fail_export(unet, output, *args):
+            output.write_bytes(b"graph")
+            raise RuntimeError("injected export failure")
+
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as temporary:
+            base = Path(temporary)
+            ram = base / "ram"
+            ram.mkdir()
+            checkpoint = base / "base.safetensors"
+            patcher = Mock(cached_patcher_init=(None, (str(checkpoint),)))
+            with patch.object(exporter, "_PACKAGE_ROOT", base / "packages"), \
+                 patch.object(exporter, "_RAM_ROOT", ram), \
+                 patch.object(exporter, "validate_precision"), \
+                 patch.object(exporter, "recover_chain", return_value=CHAIN), \
+                 patch.object(exporter, "capture_dtypes", return_value=SOURCE), \
+                 patch.object(exporter, "resolve_source", return_value=str(checkpoint)), \
+                 patch.object(exporter, "materialize_unet", new=materialize), \
+                 patch.object(exporter, "_export_onnx", new=fail_export), \
+                 patch.object(exporter.comfy.model_management, "load_models_gpu", new=lambda *a, **kw: None), \
+                 patch.object(exporter.comfy.model_management, "unload_model_and_clones", new=lambda *a: None), \
+                 patch.object(torch.cuda, "empty_cache"), \
+                 self.assertRaisesRegex(manifest.ManifestError, "injected export failure") as caught:
+                exporter.ExportTensorRTPackage().convert(
+                    patcher, types.SimpleNamespace(patcher=patcher), types.SimpleNamespace(patcher=patcher),
+                    64, 64, 154, 77, 64, 0, keep_intermediates_in_ram=True, intermediate_directory="\0ignored",
+                )
+            self.assertIsNotNone(caught.exception.__context__)
+            self.assertTrue(all(reference() is None for reference in references))
+            self.assertEqual(list(ram.iterdir()), [])
+
     def test_failed_context_does_not_retain_engine_in_traceback(self):
         runtime = importlib.import_module("trtnodes.runtime")
         references = []

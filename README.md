@@ -33,9 +33,11 @@ Arrays must contain finite floating-point values. No random calibration data is 
 
 Patched weights are materialized through ComfyUI's state-dict API into a separate UNet in memory before ONNX tracing, resolving deferred patches without tracing the shared input model. No merged checkpoint is written.
 
-`intermediate_directory` selects temporary disk storage, defaulting to `models/tensorrt/tmp`. Absolute paths and `~` are supported; relative paths use the ComfyUI directory. Temporary files are removed after generation; failures retain a diagnostic text file in this directory.
+`intermediate_directory` selects temporary disk storage, defaulting to `models/tensorrt/tmp`. Absolute paths and `~` are supported; relative paths use the ComfyUI directory. The field is locked and its value is ignored when RAM mode is enabled.
 
-`keep_intermediates_in_ram` defaults to false. Enable it to keep temporary ONNX graphs, exported tensor data and verification tensors in RAM-backed `/dev/shm` during generation. This requires sufficient shared-memory space and releases the contents when generation finishes or fails; it does not cache models across executions. On systems without `/dev/shm`, select a mounted RAM disk as `intermediate_directory` with this option disabled. Final engine publication uses temporary storage on the model filesystem to preserve atomic replacement even when the selected intermediate directory is on another filesystem. Package locks live beside packages under `models/tensorrt/.locks`. Normal exports do not use `dev_temp`; it is reserved for tests and diagnostics.
+`keep_intermediates_in_ram` defaults to false and is automatically locked off when the server has no writable `/dev/shm`. Enable it to put all build intermediates there, including ONNX graphs, exported weights, verification tensors, build reports and the candidate engine. RAM mode never creates or uses `intermediate_directory`. On Windows or other systems without `/dev/shm`, a manually mounted RAM disk can still be selected as `intermediate_directory` with RAM mode disabled.
+
+Temporary contents are removed after success, failure or cancellation in both modes. No intermediate checkpoints, build reports or failure diagnostic files are retained; errors appear in the normal execution error. Failed-export tracebacks release private model references as well. Final engine publication and rollback use a short-lived transaction on the output filesystem for atomic replacement. Package locks live beside packages under `models/tensorrt/.locks`. Normal exports do not use `dev_temp`; it is reserved for tests and diagnostics.
 
 `package_name` selects a folder under `models/tensorrt`; blank uses the checkpoint stem. Choose a separate folder for each different checkpoint/LoRA chain. Existing sources are compared directly, including LoRA order, both strengths, and source loading dtypes; a mismatch is rejected. Precision, resolution, and context profile do not change source identity.
 
@@ -92,6 +94,8 @@ python custom_nodes/TensorRTNodes/tests/test_quantization.py
 python custom_nodes/TensorRTNodes/tests/test_benchmark.py
 TENSORRT_TEST_GPU=1 python custom_nodes/TensorRTNodes/tests/test_gpu.py
 ```
+
+The frontend control-locking tests use Node's built-in test runner: `node --test custom_nodes/TensorRTNodes/tests/test_storage_widgets.mjs`.
 
 GPU tests build small synthetic engines and test precision inspection, dynamic contexts, batching, replacement, output types, and repeated release/reload. They are not SDXL benchmarks. Set `TENSORRT_TEST_PRECISIONS=fp32,fp16,bf16` to test a subset when optional quantization dependencies are unavailable. Test artifacts stay under `dev_temp/tensorrt`.
 
