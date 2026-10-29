@@ -69,6 +69,8 @@ Context profiles and tensor shapes/types are read from the engine itself. Plans 
 
 **Model Switcher** takes required `trigger: ANY` and `engine_model: MODEL`, and returns only MODEL. Its non-lazy trigger is a normal execution dependency. It releases TensorRT contexts and engines, unloads the managed model, and reconstructs a conventional model from the original checkpoint and ordered LoRAs using native ComfyUI patching. Future TensorRT execution can deserialize the engine again. Missing checkpoint/LoRA files produce explicit errors and configured model search directories are respected.
 
+**Size Constraint** requires Impact Pack and outputs `DETAILER_HOOK`. Connect it to FaceDetailer's `detailer_hook` and set `width`/`height` to an exported engine resolution (default 1024×1024; multiples of 8). It overrides the crop's processing size without duplicating the latent batch or changing the crop region; crops with another aspect ratio are stretched during processing and resized back afterward. Enable FaceDetailer's `force_inpaint` to prevent its size-based skip. This hook does not control Ultimate SD Upscale's tile sizes.
+
 Run tests with ComfyUI's Python from the ComfyUI root:
 
 ```sh
