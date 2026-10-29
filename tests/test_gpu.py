@@ -31,7 +31,7 @@ class SmallUNet(torch.nn.Module):
 
 @unittest.skipUnless(os.environ.get("TENSORRT_TEST_GPU") == "1", "Set TENSORRT_TEST_GPU=1 to build CUDA engines")
 class EngineTests(unittest.TestCase):
-    def test_build_resources_released_before_validation(self):
+    def test_build_inspects_engine_without_creating_execution_context(self):
         torch.set_grad_enabled(False)
         trt = support.exporter.validate_precision("fp16")
         builder, parser, runtime = trt.Builder, trt.OnnxParser, trt.Runtime
@@ -45,7 +45,7 @@ class EngineTests(unittest.TestCase):
         def create_runtime(logger):
             self.assertEqual(len(references), 2)
             self.assertTrue(all(reference() is None for reference in references),
-                            "Build resources must be released before validation loads the engine")
+                            "Build resources must be released before inspection loads the engine")
             return runtime(logger)
 
         support.TEST_ROOT.mkdir(parents=True, exist_ok=True)
@@ -55,7 +55,8 @@ class EngineTests(unittest.TestCase):
             onnx = support.exporter._export_onnx(model, root / "model.onnx", 64, 64, 77, "fp16")
             with patch.object(trt, "Builder", new=lambda logger: track(builder, logger)), \
                  patch.object(trt, "OnnxParser", new=lambda network, logger: track(parser, network, logger)), \
-                 patch.object(trt, "Runtime", new=create_runtime):
+                 patch.object(trt, "Runtime", new=create_runtime), \
+                 patch.object(trt.ICudaEngine, "create_execution_context", side_effect=AssertionError("Export must not create an execution context")):
                 support.exporter._build_engine(onnx, root / "candidate.engine", root / "build.json", 64,
                     {"min": 77, "opt": 77, "max": 154}, (1, 4, 8, 8), 0, "fp16")
 
@@ -90,12 +91,11 @@ class EngineTests(unittest.TestCase):
                         model = SmallUNet().to(device="cuda", dtype=support.exporter.DTYPES[precision])
                         model.load_state_dict(copy.deepcopy(state))
                         candidate = root / "candidate.engine"
-                        onnx = support.exporter._export_onnx(model, root / f"{precision}.onnx", 64, 64, 77, precision,
-                                                             verification_path=root / "verification.pt")
+                        onnx = support.exporter._export_onnx(model, root / f"{precision}.onnx", 64, 64, 77, precision)
                         maximum = 154 + index
                         profile = {"min": 77, "opt": 77 + index, "max": maximum}
                         report = support.exporter._build_engine(onnx, candidate, root / "build.json", 64,
-                            profile, (1, 4, 8, 8), 0, precision, root / "verification.pt")
+                            profile, (1, 4, 8, 8), 0, precision)
                         support.manifest.publish_engine(root / "package", support.SOURCE, candidate, (64, 64),
                                                         precision, report["requirements"], root)
                         (root / "previous.engine").unlink(missing_ok=True)

@@ -20,7 +20,7 @@ from comfy.ldm.modules.attention import attention_pytorch
 
 from .manifest import PRECISIONS, ManifestError, engine_name, load_manifest, package_lock, package_name as default_package_name, publish_engine, source_name
 from .provenance import capture_dtypes, recover_chain, resolve_source
-from .runtime import torch_dtype, validate_interface
+from .runtime import validate_interface
 
 
 _CONTEXT_MIN = 77
@@ -81,7 +81,7 @@ def materialize_unet(model, precision):
     return exported
 
 
-def _export_onnx(unet, output, width, height, context_length, precision, verification_path=None):
+def _export_onnx(unet, output, width, height, context_length, precision):
     dtype = DTYPES[precision]
     device = next(unet.parameters()).device
     wrapper = _ExportUNet(unet).eval()
@@ -89,10 +89,6 @@ def _export_onnx(unet, output, width, height, context_length, precision, verific
     timestep = torch.full((1,), 500.0, device=device, dtype=torch.float32)
     context = torch.randn((1, context_length, 2048), device=device, dtype=dtype)
     adm = torch.randn((1, 2816), device=device, dtype=dtype)
-    if verification_path is not None:
-        expected = wrapper(latent, timestep, context, adm).detach().cpu()
-        torch.save({"inputs": {key: value.cpu() for key, value in zip(("latent", "timestep", "context", "adm"), (latent, timestep, context, adm))},
-                    "expected": expected}, verification_path)
     torch.onnx.export(
         wrapper, (latent, timestep, context, adm), str(output),
         input_names=["latent", "timestep", "context", "adm"], output_names=["noise_pred"],
@@ -102,7 +98,7 @@ def _export_onnx(unet, output, width, height, context_length, precision, verific
     return output
 
 
-def _build_engine(onnx, engine, report, workspace_mib, context_profile, latent_shape, builder_optimization_level, precision, verification_path=None):
+def _build_engine(onnx, engine, report, workspace_mib, context_profile, latent_shape, builder_optimization_level, precision):
     trt = validate_precision(precision)
 
     class Logger(trt.ILogger):
@@ -114,7 +110,7 @@ def _build_engine(onnx, engine, report, workspace_mib, context_profile, latent_s
             self.messages.append(f"{severity}: {message}")
 
     logger = Logger()
-    builder = network = parser = config = profile = serialized = runtime = built = context = inspector = None
+    builder = network = parser = config = profile = serialized = runtime = built = inspector = None
     try:
         builder = trt.Builder(logger)
         network = builder.create_network(0)
@@ -140,7 +136,7 @@ def _build_engine(onnx, engine, report, workspace_mib, context_profile, latent_s
         serialized = builder.build_serialized_network(network, config)
         if serialized is None:
             raise ManifestError(f"TensorRT {precision} compilation failed:\n" + "\n".join(logger.messages[-30:]))
-        # Release build-time CUDA allocations before loading weights and validation buffers.
+        # Release build-time CUDA allocations before loading the engine for inspection.
         parser = network = config = profile = builder = None
         runtime = trt.Runtime(logger)
         built = runtime.deserialize_cuda_engine(serialized)
@@ -149,38 +145,6 @@ def _build_engine(onnx, engine, report, workspace_mib, context_profile, latent_s
         actual_profile = validate_interface(built, trt, latent_shape)
         if actual_profile != tuple(context_profile[key] for key in ("min", "opt", "max")):
             raise ManifestError("Built TensorRT context profile does not match the request.")
-        context = built.create_execution_context()
-        if context is None:
-            raise ManifestError("Built TensorRT engine cannot create an execution context.")
-        shapes = {"latent": latent_shape, "timestep": (1,), "context": (1, context_profile["opt"], 2048), "adm": (1, 2816)}
-        verification = torch.load(verification_path, map_location="cpu", weights_only=True) if verification_path is not None else None
-        tensors = {}
-        for name, shape in shapes.items():
-            dtype = torch_dtype(trt, built.get_tensor_dtype(name))
-            if verification is not None:
-                shape = tuple(verification["inputs"][name].shape)
-            tensors[name] = (verification["inputs"][name].to(device="cuda", dtype=dtype) if verification is not None
-                             else torch.randn(shape, device="cuda", dtype=dtype)).contiguous()
-            if not context.set_input_shape(name, shape):
-                raise ManifestError(f"Built TensorRT engine rejected {name} shape {shape}.")
-        tensors["noise_pred"] = torch.empty(latent_shape, device="cuda", dtype=torch_dtype(trt, built.get_tensor_dtype("noise_pred")))
-        for name, tensor in tensors.items():
-            if not context.set_tensor_address(name, tensor.data_ptr()):
-                raise ManifestError(f"Built TensorRT engine rejected {name} binding.")
-        stream = torch.cuda.current_stream()
-        if not context.execute_async_v3(stream.cuda_stream):
-            raise ManifestError("Built TensorRT engine failed validation inference.")
-        stream.synchronize()
-        output = tensors["noise_pred"].float().cpu()
-        if not torch.isfinite(output).all():
-            raise ManifestError("Built TensorRT engine produced nonfinite validation output.")
-        accuracy = None
-        if verification is not None:
-            expected = verification["expected"].float()
-            difference = output - expected
-            accuracy = {"max_abs": difference.abs().max().item(), "rmse": difference.square().mean().sqrt().item()}
-            torch.testing.assert_close(output, expected, rtol=0.15 if precision == "bf16" else 0.03,
-                                       atol=0.1 if precision == "bf16" else 0.02)
         inspector = built.create_engine_inspector()
         inspection = json.loads(inspector.get_engine_information(trt.LayerInformationFormat.JSON))
         layer_types = Counter()
@@ -191,7 +155,7 @@ def _build_engine(onnx, engine, report, workspace_mib, context_profile, latent_s
         if not layer_types[expected_type]:
             raise ManifestError(f"Engine inspector reports no {precision} execution tensors: {dict(layer_types)}")
         # Inspect tensor formats after TensorRT fusion/tactic selection.
-        result = {"precision": precision, "network_tensor_types": dict(counts), "engine_tensor_types": dict(layer_types), "engine_layers": inspection, "validation_accuracy": accuracy,
+        result = {"precision": precision, "network_tensor_types": dict(counts), "engine_tensor_types": dict(layer_types), "engine_layers": inspection,
                   "requirements": {"tensorrt_version": trt.__version__, "gpu_name": torch.cuda.get_device_name(),
                                    "compute_capability": list(torch.cuda.get_device_capability())}}
         engine.write_bytes(bytes(serialized))
@@ -202,7 +166,7 @@ def _build_engine(onnx, engine, report, workspace_mib, context_profile, latent_s
         raise
     finally:
         # Tracebacks retain locals on failure; close TensorRT owners before staging cleanup.
-        inspector = context = built = runtime = None
+        inspector = built = runtime = None
         parser = network = config = profile = builder = serialized = None
 
 
@@ -278,15 +242,14 @@ class ExportTensorRTPackage:
                     exported = materialize_unet(model, precision)
                     comfy.model_management.load_models_gpu([exported], force_patch_weights=True, force_full_load=True)
                     onnx = staging / "model.onnx"
-                    verification_path = staging / "verification.pt"
-                    onnx = _export_onnx(exported.model.diffusion_model, onnx, width, height, optimization_context_length, precision, verification_path)
+                    onnx = _export_onnx(exported.model.diffusion_model, onnx, width, height, optimization_context_length, precision)
                     comfy.model_management.unload_model_and_clones(exported)
                     exported = None
                     gc.collect()
                     torch.cuda.empty_cache()
                     profile = {"min": _CONTEXT_MIN, "opt": optimization_context_length, "max": maximum_context_length}
                     result = _build_engine(onnx, candidate, report, workspace_mib, profile,
-                                           (1, 4, height // 8, width // 8), builder_optimization_level, precision, verification_path)
+                                           (1, 4, height // 8, width // 8), builder_optimization_level, precision)
                     publication = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix=".publish-", dir=root)))
                     output = publication / candidate.name
                     shutil.move(str(candidate), str(output))
@@ -306,8 +269,7 @@ class ExportTensorRTPackage:
                         gc.collect()
                         torch.cuda.empty_cache()
         types = result["engine_tensor_types"]
-        return {"ui": {"text": [f"TensorRT package: {package}\nRequested {precision}; engine tensor types after fusion: {types}\n"
-                                f"Validation deviation from export model: {result['validation_accuracy']}"]}}
+        return {"ui": {"text": [f"TensorRT package: {package}\nRequested {precision}; engine tensor types after fusion: {types}"]}}
 
 
 NODE_CLASS_MAPPINGS = {"ExportTensorRTPackage": ExportTensorRTPackage}

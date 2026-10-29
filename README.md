@@ -14,13 +14,13 @@ Version 3 records the actual MODEL, CLIP, and VAE loading dtypes in `source.load
 | `fp16` | FP16 graph with existing explicit higher precision operations preserved. |
 | `bf16` | BF16 graph with existing explicit higher precision operations preserved; requires SM80 or newer. |
 
-The exporter uses TensorRT 11's [strongly typed precision rules](https://docs.nvidia.com/deeplearning/tensorrt/latest/api/migration/tensorrt-10x-to-11x-python-api-patterns.html). Each build must deserialize, produce finite output, match the export model within its precision tolerance, and expose the requested precision in engine inspection before publication.
+The exporter uses TensorRT 11's [strongly typed precision rules](https://docs.nvidia.com/deeplearning/tensorrt/latest/api/migration/tensorrt-10x-to-11x-python-api-patterns.html). Before publication, it inspects the engine interface, context profile, and precision without creating an execution context or running validation inference.
 
 Patched weights are materialized through ComfyUI's state-dict API into a separate UNet in memory before ONNX tracing, resolving deferred patches without tracing the shared input model. No merged checkpoint is written.
 
 `intermediate_directory` selects temporary disk storage, defaulting to `models/tensorrt/tmp`. Absolute paths and `~` are supported; relative paths use the ComfyUI directory. The field is locked and its value is ignored when RAM mode is enabled.
 
-`keep_intermediates_in_ram` defaults to false and is automatically locked off when the server has no writable `/dev/shm`. Enable it to put all build intermediates there, including ONNX graphs, exported weights, verification tensors, build reports and the candidate engine. RAM mode never creates or uses `intermediate_directory`. On Windows or other systems without `/dev/shm`, a manually mounted RAM disk can still be selected as `intermediate_directory` with RAM mode disabled.
+`keep_intermediates_in_ram` defaults to false and is automatically locked off when the server has no writable `/dev/shm`. Enable it to put all build intermediates there, including ONNX graphs, exported weights, build reports and the candidate engine. RAM mode never creates or uses `intermediate_directory`. On Windows or other systems without `/dev/shm`, a manually mounted RAM disk can still be selected as `intermediate_directory` with RAM mode disabled.
 
 Temporary contents are removed after success, failure or cancellation in both modes. No intermediate checkpoints, build reports or failure diagnostic files are retained; errors appear in the normal execution error. Failed-export tracebacks release private model references as well. Final engine publication and rollback use a short-lived transaction on the output filesystem for atomic replacement. Package locks live beside packages under `models/tensorrt/.locks`. Normal exports do not use `dev_temp`; it is reserved for tests and diagnostics.
 

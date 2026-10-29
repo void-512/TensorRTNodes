@@ -379,7 +379,6 @@ class StorageTests(unittest.TestCase):
                     output.write_bytes(b"temporary graph")
                     output.with_suffix(".data").write_bytes(b"temporary weights")
                     (output.parent / "merged.safetensors").write_bytes(b"merged weights")
-                    args[-1].write_bytes(b"verification")
                     if failure == "export":
                         raise RuntimeError("injected export failure")
                     if failure == "cancel":
@@ -457,18 +456,16 @@ class StorageTests(unittest.TestCase):
                 self.assertEqual(output.parent.parent, ram if keep_in_ram else expected)
                 output.write_bytes(b"graph")
                 output.with_suffix(".data").write_bytes(b"weights")
-                args[-1].write_bytes(b"verification")
                 observed.append(output.parent)
                 return output
 
             def build(onnx, candidate, report, *args):
                 self.assertTrue(onnx.is_file())
-                self.assertTrue(args[-1].is_file())
                 self.assertEqual(candidate.parent, onnx.parent)
                 self.assertEqual(report.parent, onnx.parent)
                 candidate.write_bytes(b"new engine")
                 report.write_text("{}")
-                return {"requirements": REQ, "engine_tensor_types": {"Half": 1}, "validation_accuracy": {"rmse": 0}}
+                return {"requirements": REQ, "engine_tensor_types": {"Half": 1}}
 
             with self.subTest(ram=keep_in_ram, directory=directory), \
                  patch.object(exporter, "_PACKAGE_ROOT", self.root.parent), \
