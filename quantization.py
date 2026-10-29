@@ -106,6 +106,43 @@ def validate_quantized_graph(graph: onnx.GraphProto, precision: str) -> None:
     raise ManifestError(f"ModelOpt did not produce {precision} weight-and-activation quantized matrix operations.")
 
 
+def _remove_softmax_quantization(graph: onnx.GraphProto) -> None:
+    # Linear-only calibration leaves Q/K/V outputs in Half. ModelOpt's added
+    # Softmax Q/DQ prevents TensorRT from fusing that higher precision attention.
+    producers = {output: (index, node) for index, node in enumerate(graph.node) for output in node.output}
+    consumers = {}
+    for node in graph.node:
+        for value in node.input:
+            consumers.setdefault(value, []).append(node)
+    removed = set()
+    for index, node in enumerate(graph.node):
+        if node.op_type != "DequantizeLinear" or node.input[0] not in producers:
+            continue
+        quant_index, quant = producers[node.input[0]]
+        if quant.op_type != "QuantizeLinear" or quant.input[0] not in producers:
+            continue
+        _, softmax = producers[quant.input[0]]
+        users = consumers.get(node.output[0], [])
+        if softmax.op_type != "Softmax" or len(consumers[quant.output[0]]) != 1 or not users or any(user.op_type != "MatMul" for user in users):
+            continue
+        for user in users:
+            for position, value in enumerate(user.input):
+                if value == node.output[0]:
+                    user.input[position] = softmax.output[0]
+        removed.update((index, quant_index))
+    if removed:
+        nodes = [node for index, node in enumerate(graph.node) if index not in removed]
+        del graph.node[:]
+        graph.node.extend(nodes)
+        used = {value for node in nodes for value in node.input} | {value.name for value in graph.output}
+        initializers = [value for value in graph.initializer if value.name in used]
+        values = [value for value in graph.value_info if value.name in used]
+        del graph.initializer[:]
+        graph.initializer.extend(initializers)
+        del graph.value_info[:]
+        graph.value_info.extend(values)
+
+
 def finish_export(path: Path, precision: str) -> Path:
     if precision in {"fp8", "nvfp4"}:
         _, exporters, _ = modelopt_modules()
@@ -116,6 +153,8 @@ def finish_export(path: Path, precision: str) -> Path:
             onnx.shape_inference.infer_shapes_path(str(path), str(inferred))
             path = inferred
         model = exporters[precision].process_model(onnx.load(str(path)))
+        if precision == "fp8":
+            _remove_softmax_quantization(model.graph)
         converted = path.with_name(path.stem + ".quantized.onnx")
         onnx.save_model(model, str(converted), save_as_external_data=True, all_tensors_to_one_file=True,
                         location=converted.with_suffix(".data").name, size_threshold=1024)

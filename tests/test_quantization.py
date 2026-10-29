@@ -99,6 +99,40 @@ class QuantizedGraphTests(unittest.TestCase):
             with self.subTest(precision=precision), self.assertRaisesRegex(manifest.ManifestError, "weight-and-activation"):
                 quantization.validate_quantized_graph(graph, precision)
 
+    def attention_graph(self):
+        graph = self.graph("fp8")
+        graph.node.extend([
+            onnx.helper.make_node("Softmax", ["scores"], ["probabilities"]),
+            onnx.helper.make_node("QuantizeLinear", ["probabilities", "softmax_scale"], ["pq"]),
+            onnx.helper.make_node("DequantizeLinear", ["pq", "softmax_scale"], ["pdq"]),
+            onnx.helper.make_node("MatMul", ["pdq", "values"], ["attention"]),
+        ])
+        graph.initializer.append(onnx.helper.make_tensor("softmax_scale", onnx.TensorProto.FLOAT16, [], [1 / 448]))
+        return graph
+
+    def test_linear_quantization_retained_when_attention_is_restored(self):
+        graph = self.attention_graph()
+        quantization._remove_softmax_quantization(graph)
+        self.assertEqual(graph.node[-1].input[0], "probabilities")
+        self.assertEqual(sum(node.op_type == "QuantizeLinear" for node in graph.node), 1)
+        self.assertEqual(sum(node.op_type == "DequantizeLinear" for node in graph.node), 2)
+        self.assertEqual([item.name for item in graph.initializer], ["weight"])
+        quantization.validate_quantized_graph(graph, "fp8")
+
+    def test_shared_quantized_attention_value_is_preserved(self):
+        for value in ("pq", "pdq"):
+            graph = self.attention_graph()
+            graph.node.append(onnx.helper.make_node("Identity", [value], ["another_consumer"]))
+            before = graph.SerializeToString()
+            quantization._remove_softmax_quantization(graph)
+            self.assertEqual(graph.SerializeToString(), before)
+
+    def test_non_attention_quantization_is_unchanged(self):
+        graph = self.graph("fp8")
+        before = graph.SerializeToString()
+        quantization._remove_softmax_quantization(graph)
+        self.assertEqual(graph.SerializeToString(), before)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
