@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import threading
 
 import torch
+import comfy.model_management
 import comfy.model_patcher
 
 from .manifest import EngineSpec, ManifestError, PackageManifest, load_manifest, package_lock
@@ -193,6 +194,11 @@ class TensorRTModelPatcher(comfy.model_patcher.ModelPatcher):
     def __init__(self, model, load_device, offload_device, size=0, weight_inplace_update=False, fast_disk=False):
         super().__init__(model, load_device, offload_device, size, weight_inplace_update, fast_disk)
         self.engine_unet = model.diffusion_model
+
+    def pre_run(self):
+        super().pre_run()
+        # TensorRT's CUDA allocations cannot reuse PyTorch's cached blocks.
+        comfy.model_management.soft_empty_cache()
 
     def model_size(self):
         return max(self.loaded_size(), max(spec.path.stat().st_size for spec in self.engine_unet.package.engines))

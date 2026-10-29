@@ -601,6 +601,18 @@ class PrecisionTests(unittest.TestCase):
 
 
 class MemoryTests(unittest.TestCase):
+    def test_patcher_returns_torch_cache_to_cuda_before_sampling(self):
+        base = torch.nn.Module()
+        base.diffusion_model = torch.nn.Module()
+        patcher = loader.TensorRTModelPatcher(base, torch.device("cpu"), torch.device("cpu"))
+        events = []
+        patcher.add_callback(loader.comfy.patcher_extension.CallbacksMP.ON_PRE_RUN,
+                             lambda p: events.append("callback"))
+        with patch.object(loader.comfy.model_management, "soft_empty_cache", side_effect=lambda: events.append("cache")):
+            for _ in range(2):
+                patcher.pre_run()
+        self.assertEqual(events, ["callback", "cache", "callback", "cache"])
+
     def test_failed_export_does_not_retain_merged_weights_in_traceback(self):
         TEST_ROOT.mkdir(parents=True, exist_ok=True)
         references = []
