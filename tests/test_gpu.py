@@ -10,6 +10,8 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import weakref
+from unittest.mock import patch
 
 import test_regressions as support
 import torch
@@ -29,6 +31,34 @@ class SmallUNet(torch.nn.Module):
 
 @unittest.skipUnless(os.environ.get("TENSORRT_TEST_GPU") == "1", "Set TENSORRT_TEST_GPU=1 to build CUDA engines")
 class EngineTests(unittest.TestCase):
+    def test_build_resources_released_before_validation(self):
+        torch.set_grad_enabled(False)
+        trt = support.exporter.validate_precision("fp16")
+        builder, parser, runtime = trt.Builder, trt.OnnxParser, trt.Runtime
+        references = []
+
+        def track(factory, *args):
+            resource = factory(*args)
+            references.append(weakref.ref(resource))
+            return resource
+
+        def create_runtime(logger):
+            self.assertEqual(len(references), 2)
+            self.assertTrue(all(reference() is None for reference in references),
+                            "Build resources must be released before validation loads the engine")
+            return runtime(logger)
+
+        support.TEST_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=support.TEST_ROOT) as temporary:
+            root = Path(temporary)
+            model = SmallUNet().cuda().half()
+            onnx = support.exporter._export_onnx(model, root / "model.onnx", 64, 64, 77, "fp16")
+            with patch.object(trt, "Builder", new=lambda logger: track(builder, logger)), \
+                 patch.object(trt, "OnnxParser", new=lambda network, logger: track(parser, network, logger)), \
+                 patch.object(trt, "Runtime", new=create_runtime):
+                support.exporter._build_engine(onnx, root / "candidate.engine", root / "build.json", 64,
+                    {"min": 77, "opt": 77, "max": 154}, (1, 4, 8, 8), 0, "fp16")
+
     def test_failed_parser_cleans_staging(self):
         support.TEST_ROOT.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=support.TEST_ROOT) as temporary:

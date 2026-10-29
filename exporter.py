@@ -140,6 +140,8 @@ def _build_engine(onnx, engine, report, workspace_mib, context_profile, latent_s
         serialized = builder.build_serialized_network(network, config)
         if serialized is None:
             raise ManifestError(f"TensorRT {precision} compilation failed:\n" + "\n".join(logger.messages[-30:]))
+        # Release build-time CUDA allocations before loading weights and validation buffers.
+        parser = network = config = profile = builder = None
         runtime = trt.Runtime(logger)
         built = runtime.deserialize_cuda_engine(serialized)
         if built is None:
