@@ -5,7 +5,7 @@ class SizeConstraint(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id="SizeConstraint", display_name="Size Constraint", category="TensorRT/detailers",
+            node_id="SizeConstraint", display_name="FaceDetailer Size Constraint", category="TensorRT/detailers",
             description="Requires Impact Pack. Resizes each detailer crop to exactly width × height before encoding, without duplicating the batch. Match the TensorRT engine resolution.",
             inputs=[
                 io.Int.Input("width", default=1024, min=64, max=16384, step=8),
@@ -20,7 +20,7 @@ class SizeConstraint(io.ComfyNode):
         from impact.hooks import DetailerHook
 
         if width <= 0 or height <= 0 or width % 8 or height % 8:
-            raise ValueError("Size Constraint width and height must be positive multiples of 8.")
+            raise ValueError("FaceDetailer Size Constraint width and height must be positive multiples of 8.")
 
         class SizeConstraintHook(DetailerHook):
             def __init__(self, width, height):
@@ -35,4 +35,4 @@ class SizeConstraint(io.ComfyNode):
 
 
 NODE_CLASS_MAPPINGS = {"SizeConstraint": SizeConstraint}
-NODE_DISPLAY_NAME_MAPPINGS = {"SizeConstraint": "Size Constraint"}
+NODE_DISPLAY_NAME_MAPPINGS = {"SizeConstraint": "FaceDetailer Size Constraint"}
