@@ -8,15 +8,15 @@ import numpy as np
 import onnx
 import torch
 
-from .manifest import TEMP_ROOT, ManifestError
+from .manifest import ManifestError
 
 
 def load_calibration(filename: str, width: int, height: int) -> dict[str, np.ndarray]:
     if not filename:
-        raise ManifestError("FP8/NVFP4 require representative denoising calibration data (.npz) under ComfyUI/dev_temp. Supply calibration_data; random calibration is not used.")
-    path = Path(filename).resolve()
-    if not path.is_relative_to(TEMP_ROOT.parent.resolve()) or path.suffix != ".npz" or not path.is_file():
-        raise ManifestError("calibration_data must be an existing .npz file under ComfyUI/dev_temp.")
+        raise ManifestError("FP8/NVFP4 require representative denoising calibration data (.npz). Supply calibration_data; random calibration is not used.")
+    path = Path(filename).expanduser().resolve()
+    if path.suffix != ".npz" or not path.is_file():
+        raise ManifestError("calibration_data must be an existing .npz file.")
     with np.load(path, allow_pickle=False) as archive:
         if set(archive.files) != {"latent", "timestep", "context", "adm"}:
             raise ManifestError("Calibration requires latent, timestep, context, and adm arrays from real denoising calls.")

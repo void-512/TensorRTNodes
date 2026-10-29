@@ -5,9 +5,12 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import onnx
+
+TEST_ROOT = Path(__file__).resolve().parents[3] / "dev_temp" / "tensorrt"
 
 package = types.ModuleType("trtnodes")
 package.__path__ = [str(Path(__file__).resolve().parents[1])]
@@ -18,8 +21,8 @@ manifest = importlib.import_module("trtnodes.manifest")
 
 class CalibrationTests(unittest.TestCase):
     def setUp(self):
-        manifest.TEMP_ROOT.mkdir(parents=True, exist_ok=True)
-        self.temporary = tempfile.TemporaryDirectory(dir=manifest.TEMP_ROOT)
+        TEST_ROOT.mkdir(parents=True, exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(dir=TEST_ROOT)
         self.addCleanup(self.temporary.cleanup)
         self.path = Path(self.temporary.name) / "calibration.npz"
         self.data = {"latent": np.zeros((2, 1, 4, 8, 8), dtype=np.float16),
@@ -40,9 +43,17 @@ class CalibrationTests(unittest.TestCase):
         with self.assertRaisesRegex(manifest.ManifestError, "representative"):
             quantization.load_calibration("", 64, 64)
 
-    def test_outside_development_directory(self):
-        with self.assertRaisesRegex(manifest.ManifestError, "under ComfyUI/dev_temp"):
-            quantization.load_calibration("/tmp/calibration.npz", 64, 64)
+    def test_calibration_can_be_outside_development_directory(self):
+        with patch.object(quantization.Path, "is_file", return_value=True), patch.object(quantization.np, "load") as load:
+            archive = load.return_value.__enter__.return_value
+            archive.files = list(self.data)
+            archive.__getitem__.side_effect = self.data.__getitem__
+            quantization.load_calibration("/selected/calibration.npz", 64, 64)
+            load.assert_called_once_with(Path("/selected/calibration.npz"), allow_pickle=False)
+
+    def test_missing_file(self):
+        with self.assertRaisesRegex(manifest.ManifestError, "existing .npz"):
+            quantization.load_calibration(str(self.path), 64, 64)
 
     def test_missing_inputs(self):
         del self.data["adm"]

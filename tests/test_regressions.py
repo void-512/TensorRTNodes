@@ -12,6 +12,7 @@ import weakref
 from unittest.mock import patch, Mock
 
 ROOT = Path(__file__).resolve().parents[3]
+TEST_ROOT = ROOT / "dev_temp" / "tensorrt"
 sys.path.insert(0, str(ROOT))
 sys.argv = [sys.argv[0], "--cpu"]
 import comfy.options
@@ -128,8 +129,8 @@ class SourceTests(unittest.TestCase):
                 manifest.source_name(name)
 
     def test_additional_model_directories(self):
-        manifest.TEMP_ROOT.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=manifest.TEMP_ROOT) as temporary:
+        TEST_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as temporary:
             root = Path(temporary)
             primary, extra = root / "primary", root / "extra"
             primary.mkdir()
@@ -191,8 +192,8 @@ class SourceTests(unittest.TestCase):
 
 class StorageTests(unittest.TestCase):
     def setUp(self):
-        manifest.TEMP_ROOT.mkdir(parents=True, exist_ok=True)
-        self.tmp = tempfile.TemporaryDirectory(dir=manifest.TEMP_ROOT)
+        TEST_ROOT.mkdir(parents=True, exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(dir=TEST_ROOT)
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name) / "package"
         self.staging = Path(self.tmp.name) / "staging"
@@ -224,7 +225,7 @@ class StorageTests(unittest.TestCase):
         old_manifest = (self.root / "manifest.json").read_bytes()
         replace = os.replace
         def fail_manifest(src, dst):
-            if Path(src).name == "manifest.json":
+            if Path(src).name == "candidate.json":
                 raise OSError("injected failure")
             return replace(src, dst)
         with patch("os.replace", side_effect=fail_manifest), self.assertRaisesRegex(OSError, "injected failure"):
@@ -243,7 +244,7 @@ class StorageTests(unittest.TestCase):
         replace = os.replace
         def fail_after_manifest(src, dst):
             replace(src, dst)
-            if Path(src).name == "manifest.json":
+            if Path(src).name == "candidate.json":
                 raise OSError("failure after rename")
         with patch("os.replace", side_effect=fail_after_manifest), self.assertRaisesRegex(OSError, "after rename"):
             self.publish(precision="fp32", value=b"broken")
@@ -365,18 +366,21 @@ class StorageTests(unittest.TestCase):
         checkpoint = self.staging / "base.safetensors"
         patcher = Mock(cached_patcher_init=(None, (str(checkpoint),)))
         exported = Mock()
+        ram = self.staging / "ram"
+        ram.mkdir()
 
-        for failure in ("export", "build"):
+        for failure, keep_in_ram in (("export", False), ("build", False), ("export", True), ("build", True)):
             def export_onnx(unet, output, *args):
+                self.assertEqual(output.parent.parent, ram if keep_in_ram else scratch)
                 output.write_bytes(b"temporary graph")
                 output.with_suffix(".data").write_bytes(b"temporary weights")
                 if failure == "export":
                     raise RuntimeError("injected export failure")
                 return output
 
-            with self.subTest(failure=failure), \
-                 patch.object(exporter, "TEMP_ROOT", scratch), \
+            with self.subTest(failure=failure, ram=keep_in_ram), \
                  patch.object(exporter, "_PACKAGE_ROOT", self.root.parent), \
+                 patch.object(exporter, "_RAM_ROOT", ram), \
                  patch.object(exporter, "validate_precision"), \
                  patch.object(exporter, "recover_chain", return_value=CHAIN), \
                  patch.object(exporter, "capture_dtypes", return_value=SOURCE), \
@@ -390,11 +394,70 @@ class StorageTests(unittest.TestCase):
                  self.assertRaisesRegex(manifest.ManifestError, f"injected {failure} failure"):
                 exporter.ExportTensorRTPackage().convert(
                     patcher, types.SimpleNamespace(patcher=patcher), types.SimpleNamespace(patcher=patcher),
-                    1024, 1024, 154, 77, 256, 0, package_name=self.root.name,
+                    1024, 1024, 154, 77, 256, 0, package_name=self.root.name, intermediate_directory=str(scratch),
+                    keep_intermediates_in_ram=keep_in_ram,
                 )
             self.assertEqual((self.root / "manifest.json").read_bytes(), previous)
             self.assertEqual(manifest.load_manifest(self.root).engines[0].path.read_bytes(), b"working")
             self.assertTrue(all(path.suffix == ".txt" for path in scratch.iterdir()))
+            self.assertEqual(list(ram.iterdir()), [])
+            self.assertEqual(list(self.root.parent.glob(".publish-*")), [])
+
+    def test_export_storage_paths_and_atomic_publication(self):
+        checkpoint = self.staging / "base.safetensors"
+        patcher = Mock(cached_patcher_init=(None, (str(checkpoint),)))
+        ram = self.staging / "ram"
+        ram.mkdir()
+        paths = [(False, "", self.root.parent / "tmp"),
+                 (False, str(self.staging / "disk"), self.staging / "disk"),
+                 (False, "relative", self.staging / "relative"),
+                 (True, str(self.staging / "disk"), self.staging / "disk")]
+        for keep_in_ram, directory, expected in paths:
+            exported = Mock()
+            observed = []
+
+            def export_onnx(unet, output, *args):
+                self.assertEqual(output.parent.parent, ram if keep_in_ram else expected)
+                output.write_bytes(b"graph")
+                output.with_suffix(".data").write_bytes(b"weights")
+                args[-1].write_bytes(b"verification")
+                observed.append(output.parent)
+                return output
+
+            def build(onnx, candidate, report, *args):
+                self.assertTrue(onnx.is_file())
+                self.assertTrue(args[-1].is_file())
+                self.assertEqual(candidate.parent.parent, self.root.parent)
+                self.assertEqual(report.parent.parent, expected)
+                self.assertNotEqual(candidate.parent, onnx.parent)
+                candidate.write_bytes(b"new engine")
+                report.write_text("{}")
+                return {"requirements": REQ, "engine_tensor_types": {"Half": 1}, "validation_accuracy": {"rmse": 0}}
+
+            with self.subTest(ram=keep_in_ram, directory=directory), \
+                 patch.object(exporter, "_PACKAGE_ROOT", self.root.parent), \
+                 patch.object(exporter, "_RAM_ROOT", ram), \
+                 patch.object(exporter.folder_paths, "base_path", str(self.staging)), \
+                 patch.object(exporter, "validate_precision"), \
+                 patch.object(exporter, "recover_chain", return_value=CHAIN), \
+                 patch.object(exporter, "capture_dtypes", return_value=SOURCE), \
+                 patch.object(exporter, "resolve_source", return_value=str(checkpoint)), \
+                 patch.object(exporter, "materialize_unet", return_value=exported), \
+                 patch.object(exporter, "_export_onnx", side_effect=export_onnx), \
+                 patch.object(exporter, "_build_engine", side_effect=build), \
+                 patch.object(exporter.comfy.model_management, "load_models_gpu"), \
+                 patch.object(exporter.comfy.model_management, "unload_model_and_clones"), \
+                 patch.object(torch.cuda, "empty_cache"):
+                exporter.ExportTensorRTPackage().convert(
+                    patcher, types.SimpleNamespace(patcher=patcher), types.SimpleNamespace(patcher=patcher),
+                    1024, 1024, 154, 77, 256, 0, package_name=self.root.name,
+                    intermediate_directory=directory, keep_intermediates_in_ram=keep_in_ram,
+                )
+            self.assertEqual(manifest.load_manifest(self.root).engines[0].path.read_bytes(), b"new engine")
+            self.assertTrue(all(not path.exists() for path in observed))
+            self.assertEqual(list(expected.iterdir()), [])
+            self.assertEqual(list(ram.iterdir()), [])
+            self.assertEqual(list(self.root.parent.glob(".publish-*")), [])
 
 
 class SwitcherTests(unittest.TestCase):
@@ -457,6 +520,9 @@ class PrecisionTests(unittest.TestCase):
     def test_choices(self):
         self.assertEqual(exporter.ExportTensorRTPackage.INPUT_TYPES()["optional"]["precision"][0], list(manifest.PRECISIONS))
         self.assertEqual(exporter.ExportTensorRTPackage.INPUT_TYPES()["optional"]["package_name"][1]["default"], "")
+        options = exporter.ExportTensorRTPackage.INPUT_TYPES()["optional"]
+        self.assertFalse(options["keep_intermediates_in_ram"][1]["default"])
+        self.assertEqual(Path(options["intermediate_directory"][1]["default"]), exporter._PACKAGE_ROOT / "tmp")
 
     def test_quantization_refusal(self):
         with self.assertRaisesRegex(manifest.ManifestError, "representative denoising"):
@@ -480,8 +546,8 @@ class MemoryTests(unittest.TestCase):
                 engine = Engine()
                 references.append(weakref.ref(engine))
                 return engine
-        manifest.TEMP_ROOT.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=manifest.TEMP_ROOT) as temporary:
+        TEST_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as temporary:
             root = Path(temporary)
             engine = root / "candidate.engine"
             engine.write_bytes(b"engine")
@@ -538,8 +604,8 @@ class MemoryTests(unittest.TestCase):
             def release(self):
                 self.resident = 0
 
-        manifest.TEMP_ROOT.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=manifest.TEMP_ROOT) as temporary:
+        TEST_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as temporary:
             path = Path(temporary) / "model.engine"
             path.write_bytes(b"plan")
             base = torch.nn.Module()

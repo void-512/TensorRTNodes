@@ -31,8 +31,8 @@ class SmallUNet(torch.nn.Module):
 @unittest.skipUnless(os.environ.get("TENSORRT_TEST_GPU") == "1", "Set TENSORRT_TEST_GPU=1 to build CUDA engines")
 class EngineTests(unittest.TestCase):
     def test_failed_parser_cleans_staging(self):
-        support.manifest.TEMP_ROOT.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=support.manifest.TEMP_ROOT) as temporary:
+        support.TEST_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=support.TEST_ROOT) as temporary:
             root = Path(temporary)
             onnx = root / "invalid.onnx"
             onnx.write_bytes(b"invalid ONNX")
@@ -46,8 +46,8 @@ class EngineTests(unittest.TestCase):
         torch.set_grad_enabled(False)
         torch.set_num_threads(4)
         torch.manual_seed(812)
-        support.manifest.TEMP_ROOT.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=support.manifest.TEMP_ROOT) as temporary:
+        support.TEST_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=support.TEST_ROOT) as temporary:
             root = Path(temporary)
             state = SmallUNet().state_dict()
             x = torch.randn(2, 4, 8, 8, device="cuda")

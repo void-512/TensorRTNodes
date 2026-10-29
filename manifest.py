@@ -9,7 +9,6 @@ from pathlib import Path
 import re
 
 
-TEMP_ROOT = Path(__file__).resolve().parents[2] / "dev_temp" / "tensorrt"
 PRECISIONS = ("fp32", "fp16", "bf16", "fp8", "nvfp4")
 SOURCE_DTYPES = ("float32", "float16", "bfloat16", "float8_e4m3fn", "float8_e5m2")
 
@@ -60,8 +59,8 @@ def engine_name(chain: dict, width: int, height: int) -> str:
 
 @contextmanager
 def package_lock(root):
-    TEMP_ROOT.mkdir(parents=True, exist_ok=True)
-    locks = TEMP_ROOT / "locks" / str(Path(root).resolve()).replace("\\", "/").lstrip("/").replace(":", "_")
+    root = Path(root).resolve()
+    locks = root.parent / ".locks" / root.name
     locks.mkdir(parents=True, exist_ok=True)
     lock = locks / "active"
     try:
@@ -166,7 +165,7 @@ def publish_engine(root, chain, candidate, image_size, precision, requirements, 
         ]}
         data["engines"].append({"path": relative, "image_size": list(image_size), "precision": precision, "requirements": requirements})
         data["engines"].sort(key=lambda item: item["image_size"])
-        manifest = staging / "manifest.json"
+        manifest = staging / "candidate.json"
         manifest.write_text(json.dumps(data, indent=2, allow_nan=False) + "\n", encoding="utf-8")
         backup_engine = staging / "previous.engine"
         backup_manifest = staging / "previous.json"
